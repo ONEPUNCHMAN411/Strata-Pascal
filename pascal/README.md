@@ -30,4 +30,10 @@ Upstream Strata carries an experimental Pascal build (`-DSTRATA_EXPERIMENTAL_SM6
 Verified in a GPU-less container: full build with CUDA 12.8 for sm_60 succeeds (54 sm_60 cubins, no errors);
 CPU-only tests pass; GPU tests need the real cards.
 
-Normal install on the server: `./setup.sh --gpus 0,1` (add `--models-dir DIR` for the NVMe).
+Install on the server (IQ3_S: 54.8 GB of weights + a 28.8 GB n-gram shard that can stay memory-mapped on the NVMe;
+matches BF16 on ISTA's AIME25 / GPQA-D / LCB v6 benchmarks):
+
+    ./setup.sh --model IQ3_S --gpus 0,1 --build --models-dir /home/venkata/models
+
+IQ3_S tensor types (ISTA allocation file): expert gate/up IQ2_S x20, IQ3_XXS x17, IQ3_S x10, IQ4_XS x1 layers; expert
+down IQ4_NL x39, Q2_0 x9; dense mostly Q6_K / Q4_K / Q5_K / IQ4_XS / IQ4_NL. All run in the kernels tuned above.
