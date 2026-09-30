@@ -2140,6 +2140,20 @@ int main(int argc, char** argv) {
             stages[i]->lb = split_at[i];
             stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : g.n_layers;
         }
+        // Every device loaded all 48 layers' native matrices before the split search; each runs only its own range
+        // (verifier, prompt path and session are carved; a split captures no token graph). The rest is freed here,
+        // before the expert caches are sized, so it becomes cached experts. STRATA_SPLIT_KEEP_DENSE=1: keep all.
+        if (std::getenv("STRATA_SPLIT_KEEP_DENSE") == nullptr) {
+            uint64_t freed0 = native_dense.release_layers_outside(0, split_at[0], g.n_layers);
+            std::fprintf(stderr, "strata generate: layer split: CUDA0 freed %.2f GiB of other stages' dense matrices\n",
+                         (double) freed0 / 1073741824.0);
+            for (auto& sp : stages) {
+                const strata::core::OnDevice on(sp->dev);
+                const uint64_t f = sp->dense.release_layers_outside(sp->lb, sp->le, g.n_layers);
+                std::fprintf(stderr, "strata generate: layer split: CUDA%d freed %.2f GiB of other stages' dense matrices\n",
+                             sp->dev, (double) f / 1073741824.0);
+            }
+        }
     }
 
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A

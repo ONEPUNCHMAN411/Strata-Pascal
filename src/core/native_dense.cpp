@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -32,6 +33,7 @@ struct Pending {
     int type;
     uint64_t bytes;
     DevicePtr data;
+    std::string name;
 };
 }
 
@@ -54,7 +56,23 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 
 NativeDense::~NativeDense() {
     if (scratch_) cudaFree(scratch_);
-    for (void* p : weights_) cudaFree(p);
+    for (void* p : weights_) if (p) cudaFree(p);
+}
+
+uint64_t NativeDense::release_layers_outside(int64_t lb, int64_t le, int64_t n_layers) {
+    uint64_t freed = 0;
+    for (size_t i = 0; i < weights_.size(); ++i) {
+        long long l = -1;
+        if (!weights_[i] || std::sscanf(names_[i].c_str(), "blk.%lld.", &l) != 1) continue;
+        if (names_[i].find("ple_key") != std::string::npos) continue;   // its pointer is copied into session state
+        if (l < 0 || l >= n_layers || (l >= lb && l < le)) continue;   // no layer / the drafter's / this device's own
+        cudaFree(weights_[i]);
+        weights_[i] = nullptr;
+        refs_[i]->native_data = nullptr;
+        freed += sizes_[i];
+    }
+    bytes_ -= freed;
+    return freed;
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
@@ -155,7 +173,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
+                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), tensor.name});
             }
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
@@ -170,6 +188,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();
             weights_.push_back(item.data.release());
+            refs_.push_back(item.ref);
+            names_.push_back(item.name);
+            sizes_.push_back(item.bytes);
         }
         scratch_ = scratch.release();
         bytes_ = total;

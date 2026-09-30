@@ -7,6 +7,7 @@
 
 namespace strata::core {
 class WeightTable;
+struct WeightRef;
 
 // Experimental GDN/QSA/shared-expert projection overrides. Upload unchanged native GGUF
 // blocks once, then attach them to the matching canonical WeightRef. Unsupported
@@ -26,10 +27,16 @@ public:
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
                              std::set<std::string>& out, std::string& err);
     uint64_t weight_bytes() const { return bytes_; }
+    /// A layer split runs layers [lb, le) on this device: free the other model layers' matrices (their refs lose
+    /// the native override) so the expert cache sized afterwards gets the VRAM.  Returns the bytes freed.
+    uint64_t release_layers_outside(int64_t lb, int64_t le, int64_t n_layers);
     size_t tensor_count() const { return weights_.size(); }
 
 private:
     std::vector<void*> weights_;
+    std::vector<WeightRef*> refs_;
+    std::vector<std::string> names_;
+    std::vector<uint64_t> sizes_;
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
 };
