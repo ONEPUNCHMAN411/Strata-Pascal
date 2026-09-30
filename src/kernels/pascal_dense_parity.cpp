@@ -150,6 +150,7 @@ int main() {
     std::mt19937 rng(20260930);
     const std::vector<Ty> types = {
         {14, "Q6_K", 256, 210, {208}},
+        {12, "Q4_K", 256, 144, {0, 2}},
     };
     const std::vector<int> cols = {2, 3, 4, 6, 8};
     bool ok = true;

@@ -468,7 +468,7 @@ void launch_ty(const void* w, const void* x, float* y, int n_in, int n_out, int 
     }
 }
 
-bool covered(int ty) { return ty == 14; }
+bool covered(int ty) { return ty == 14 || ty == 12; }
 
 }  // namespace
 
