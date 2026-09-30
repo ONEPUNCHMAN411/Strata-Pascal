@@ -3,6 +3,7 @@
 #   ./pascal/server-checks.sh status                 GPU/process/memory-error/mount state
 #   ./pascal/server-checks.sh coldload FILE [FILE..]  timed uncached read of model files (NVMe vs old HDD copy)
 #   ./pascal/server-checks.sh crashrun CMD...         run CMD (e.g. the BigBang-MTP launch) with core dumps + logs
+#   ./pascal/server-checks.sh hwinfo                  CPU / NUMA / PCIe / memory facts that decide Strata's placement
 set -uo pipefail
 LOG_DIR=${LOG_DIR:-$HOME/p100-checks}; mkdir -p "$LOG_DIR"
 ts() { date +%Y%m%d-%H%M%S; }
@@ -49,5 +50,23 @@ crashrun() {
   echo "saved: $tag.log $tag.dmesg"
 }
 
+hwinfo() {
+  local out="$LOG_DIR/hwinfo-$(ts).txt"
+  {
+    echo "== CPU"; lscpu | grep -E 'Model name|Socket|Core|Thread|NUMA|MHz|L3'
+    echo "avx512: $(grep -o -m1 'avx512[a-z]*' /proc/cpuinfo | sort -u | tr '\n' ' ')  avx2: $(grep -c -m1 avx2 /proc/cpuinfo)"
+    echo "== NUMA"; numactl --hardware 2>/dev/null || echo "numactl not installed (sudo apt install numactl)"
+    echo "== memory"; free -g; grep -E 'HugePages_Total|Hugepagesize' /proc/meminfo
+    sudo dmidecode -t memory 2>/dev/null | grep -E '^\s+(Size|Speed|Configured Memory Speed|Locator):' | paste - - - - | head -16
+    echo "== GPUs and PCIe links"
+    nvidia-smi --query-gpu=index,name,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,memory.total --format=csv
+    echo "== GPU <-> CPU topology"; nvidia-smi topo -m
+    echo "== P2P"; nvidia-smi topo -p2p r 2>/dev/null
+    echo "== NVMe"; lsblk -d -o NAME,MODEL,SIZE,ROTA | grep -v loop
+    echo "== driver / CUDA"; nvidia-smi | head -4 | tail -2; ls -d /usr/local/cuda-* 2>/dev/null
+  } | tee "$out"
+  echo "saved: $out"
+}
+
 cmd=${1:-status}; shift || true
-case "$cmd" in status|coldload|crashrun) "$cmd" "$@" ;; *) sed -n 2,5p "$0"; exit 1 ;; esac
+case "$cmd" in status|coldload|crashrun|hwinfo) "$cmd" "$@" ;; *) sed -n 2,5p "$0"; exit 1 ;; esac
