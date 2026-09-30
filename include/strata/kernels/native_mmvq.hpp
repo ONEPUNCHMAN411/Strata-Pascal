@@ -29,6 +29,9 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // float rounding, speed not yet measured. true (default): the ncols == 1 layout, every column bitwise equal to a
 // single-column call. Set before
 // graph capture; captured graphs keep the kernels they captured.
+// On sm_6x (Pascal) the multi-column calls for Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL and IQ4_XS go to the FP16
+// token-tiled kernels of pascal_dense.hpp whatever this flag says: they are NOT bitwise equal to ncols == 1.
+// STRATA_PASCAL_FP16=0 (or pascal_dense_fp16_override(0)) restores the layouts above.
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
 
