@@ -24,6 +24,8 @@ namespace strata::kernels {
 /// Configure before session capture; captured graphs retain their selected kernels.
 /// In this mode shared_expert requires its optional unrounded x_f32 input.
 void shared_expert_set_native_bf16(bool enabled);
+/// Whether the gate GEMV reads the fp32 activation (then the bf16 copy callers pass is not read).
+bool shared_expert_native_bf16();
 
 /// Optional native GGUF projections. Each supported type with nonnull data
 /// replaces only that canonical projection; absent or unsupported entries fall
