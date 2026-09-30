@@ -33,6 +33,8 @@ VARIANTS = {
     "fp16":     ({"STRATA_PIN_LIMIT_GIB": "8"}, {}, "+ FP16 expert kernels only"),
     "fork":     ({}, {}, "every fork change (the default)"),
     "devplan":  ({"STRATA_VERIFY_DEVICE_PLAN": "1"}, {}, "fork + all-resident layers planned on the GPU"),
+    "pciedma":  ({}, {"--pcie-mode": "dma"}, "fork + PCIe share copied by the copy engines instead of a copy kernel"),
+    "pciedirect": ({}, {"--pcie-mode": "direct"}, "fork + PCIe share read in place by the expert kernels"),
     "spec6":    ({}, {"--spec": "6"}, "fork + verify windows up to 6 (+2 lookup)"),
     "spec8":    ({}, {"--spec": "8"}, "fork + verify windows up to 8"),
 }
