@@ -430,6 +430,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(iq_parity src/kernels/iq_parity.cpp)
   target_include_directories(iq_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(iq_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  # the Pascal tuning in iq_kernels.cu (shared-memory grids, multi-entry grouped experts): synthetic, no model
+  add_executable(pascal_iq_parity src/kernels/pascal_iq_parity.cpp)
+  target_include_directories(pascal_iq_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(pascal_iq_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME pascal_iq_parity COMMAND pascal_iq_parity)
   if(STRATA_ENABLE_CUDA)
     # native_mmvq's multi_exact contract, bitwise: a T-column call against T single-column calls on the same Q8_1
     # bytes, with the flag off as the negative control (synthetic, GPU, no model; the control assumes 32-lane warps)

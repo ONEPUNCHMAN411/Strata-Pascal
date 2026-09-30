@@ -18,10 +18,11 @@ nvidia-smi --query-gpu=index,name,compute_cap,memory.total,driver_version --form
 cmake -S . -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=OFF \
   -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=60 -DSTRATA_EXPERIMENTAL_SM60=ON \
   -DCMAKE_CUDA_COMPILER="$NVCC"
-cmake --build "$BUILD" --target strata strata-device -j "$(nproc)"
+cmake --build "$BUILD" --target strata strata-device pascal_iq_parity -j "$(nproc)"
 
 for i in $(nvidia-smi --query-gpu=index --format=csv,noheader); do
   echo "== strata-device on GPU $i"
   CUDA_VISIBLE_DEVICES=$i "$BUILD/strata-device" || echo "!! strata-device failed on GPU $i"
+  CUDA_VISIBLE_DEVICES=$i "$BUILD/pascal_iq_parity" || echo "!! pascal_iq_parity failed on GPU $i"
 done
 echo "== built: $BUILD/strata"

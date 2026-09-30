@@ -53,6 +53,28 @@ __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_
 }
 #define ggml_cuda_dp4a(a, b, c) STRATA_DP4A((a), (b), (c))
 
+// ---------------------------------------------------------------- Pascal (sm_6x) tuning
+// Two changes for the P100 build only; every other architecture compiles exactly the code above and below.
+//   * The codebook grids are copied into shared memory by the kernels that call the dot products.  On GP100 the
+//     1-8 KB grid shares the 24 KB L1/texture cache with the weight stream and is evicted by it, so every lookup
+//     (a load that depends on the weight load before it) can go to L2.  Same values, so bit-exact.
+//   * The grouped expert kernels visit each weight block once for all of a group's
+//     entries instead of re-streaming the row per entry.  Each entry still accumulates the same terms in the same
+//     order, so the sums are bit-exact too.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+#define STRATA_PASCAL_TUNE 1
+__shared__ uint64_t s_iq2xxs_grid[256];
+__shared__ uint64_t s_iq2xs_grid[512];
+__shared__ uint64_t s_iq2s_grid[1024];
+__shared__ uint32_t s_iq3xxs_grid[256];
+__shared__ uint32_t s_iq3s_grid[512];
+__shared__ uint32_t s_iq1s_grid_gpu[NGRID_IQ1S];
+#define IQ_GRID(name) s_##name
+#else
+#define STRATA_PASCAL_TUNE 0
+#define IQ_GRID(name) name
+#endif
+
 // ---------------------------------------------------------------- the dot products (vecdotq.cuh)
 __device__ __forceinline__ float vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                    const int& kbx, const int& iqs) {
@@ -86,7 +108,7 @@ __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ v
     int sumi = 0;
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
-        const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[aux8[k0 / 2]];
+        const uint2 grid_pos = ((const uint2*) IQ_GRID(iq2xxs_grid))[aux8[k0 / 2]];
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -113,7 +135,7 @@ __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(const void* __restrict__ vb
     int sumi0 = 0, sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const uint2 grid_pos = ((const uint2*) iq2xs_grid)[q2[l0 / 2] & 0x1FF];
+        const uint2 grid_pos = ((const uint2*) IQ_GRID(iq2xs_grid))[q2[l0 / 2] & 0x1FF];
         const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -147,7 +169,7 @@ __device__ __forceinline__ float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq
     int sumi0 = 0, sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int* grid_pos = (const int*) (iq2s_grid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+        const int* grid_pos = (const int*) (IQ_GRID(iq2s_grid) + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
         const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
@@ -176,7 +198,7 @@ __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(const void* __restrict__ v
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(IQ_GRID(iq3xxs_grid)[q3[l0 + 0]], IQ_GRID(iq3xxs_grid)[q3[l0 + 1]]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -204,8 +226,8 @@ __device__ __forceinline__ float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-                                        iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+        const int2 grid_pos = make_int2(IQ_GRID(iq3s_grid)[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+                                        IQ_GRID(iq3s_grid)[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
         const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -230,7 +252,7 @@ __device__ __forceinline__ float vec_dot_iq1_m_q8_1(const void* __restrict__ vbq
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int qhl = bq1->qh[2 * iqs + l0 / 4] >> (4 * ((l0 / 2) % 2));
-        const int grid = iq1s_grid_gpu[qs[l0 / 2] | ((qhl & 0x07) << 8)];
+        const int grid = IQ_GRID(iq1s_grid_gpu)[qs[l0 / 2] | ((qhl & 0x07) << 8)];
         const int grid0 = (grid >> 0) & 0x0F0F0F0F;
         const int grid1 = (grid >> 4) & 0x0F0F0F0F;
         const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
@@ -331,15 +353,70 @@ __device__ __forceinline__ float row_dot(const uint8_t* row, const block_q8_1* x
     return warp_sum(s);
 }
 
+#if STRATA_PASCAL_TUNE
+// Copy the grid format TY's dot product reads into shared memory (all threads of the block; before any early return).
+template<int TY>
+__device__ __forceinline__ void load_grid() {
+    const int n = blockDim.x * blockDim.y, t = threadIdx.y * blockDim.x + threadIdx.x;
+    if constexpr (TY == 16) {
+        for (int i = t; i < 256; i += n) s_iq2xxs_grid[i] = iq2xxs_grid[i];
+    } else if constexpr (TY == 17) {
+        for (int i = t; i < 512; i += n) s_iq2xs_grid[i] = iq2xs_grid[i];
+    } else if constexpr (TY == 22) {
+        for (int i = t; i < 1024; i += n) s_iq2s_grid[i] = iq2s_grid[i];
+    } else if constexpr (TY == 18) {
+        for (int i = t; i < 256; i += n) s_iq3xxs_grid[i] = iq3xxs_grid[i];
+    } else if constexpr (TY == 21) {
+        for (int i = t; i < 512; i += n) s_iq3s_grid[i] = iq3s_grid[i];
+    } else if constexpr (TY == 29) {
+        for (int i = t; i < NGRID_IQ1S; i += n) s_iq1s_grid_gpu[i] = iq1s_grid_gpu[i];
+    } else {
+        return;                                    // IQ4_NL / IQ4_XS / Q2_0: no grid
+    }
+    __syncthreads();
+}
+
+constexpr int MAX_ENT = 8;   // kVerifyMaxT: a group never has more entries than the window has tokens
+constexpr int ACC_STRIDE = 256;   // the largest block (the grouped kernels)
+// The per-entry sums live in shared memory, not registers: unrolled over 8 entries the dot products took ~80
+// registers (48 before), which would cut the grouped kernels to 3 blocks per SM - worse for the common 1-entry group.
+__shared__ float s_acc[MAX_ENT * ACC_STRIDE];
+
+// row_dot for n <= MAX_ENT activations (xptr(j)) at once: each weight block is visited once for all of them, and
+// entry j accumulates exactly the terms row_dot would, in the same order, so emit(j, v) gets row_dot's value bitwise.
+template<int TY, class XPtr, class Emit>
+__device__ __forceinline__ void row_dot_multi(const uint8_t* row, int n, int nb, int lane, XPtr xptr, Emit emit) {
+    using F = Fmt<TY>;
+    float* acc = s_acc + threadIdx.y * blockDim.x + threadIdx.x;
+#pragma unroll 1
+    for (int j = 0; j < n; ++j) acc[j * ACC_STRIDE] = 0.0f;
+    for (int k = lane; k < nb * F::ipb; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+#pragma unroll 1
+        for (int j = 0; j < n; ++j) acc[j * ACC_STRIDE] += F::dot(row, xptr(j) + kbx * (F::qk / 32), kbx, iqs);
+    }
+#pragma unroll 1
+    for (int j = 0; j < n; ++j) {
+        const float v = warp_sum(acc[j * ACC_STRIDE]);
+        if (lane == 0) emit(j, v);
+    }
+}
+#endif
+
 template<int TY>
 __global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                    const block_q8_1* __restrict__ x, float* __restrict__ y, int n_in,
                                                    int n_out, int ncols) {
+#if STRATA_PASCAL_TUNE
+    load_grid<TY>();
+#endif
     const int row = blockIdx.x * 4 + threadIdx.y;
     if (row >= n_out) return;
     const int lane = threadIdx.x;
     const int nb = n_in / Fmt<TY>::qk;
     const uint8_t* wr = w + (size_t) row * row_bytes;
+    // (Pascal: the grid comes from shared memory; the per-column loop stays - a 4-warp block's rows fit in L1, and
+    // the shared per-entry sums of the grouped kernels would cost this 128-thread block more occupancy than it saves)
     for (int c = 0; c < ncols; ++c) {
         const float s = row_dot<TY>(wr, x + (size_t) c * (n_in / 32), nb, lane);
         if (lane == 0) y[(size_t) c * n_out + row] = s;
@@ -358,6 +435,9 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
                                                         float* __restrict__ gate, float* __restrict__ up) {
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
+#if STRATA_PASCAL_TUNE
+    load_grid<TG>();
+#endif
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff
     if (row >= 2 * L.n_ff) return;
@@ -367,10 +447,19 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
     const uint8_t* wr = blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
     const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
+#if STRATA_PASCAL_TUNE
+    float* dst = is_up ? up : gate;
+    for (int e = e0; e < e1; e += MAX_ENT) {
+        row_dot_multi<TG>(wr, min(MAX_ENT, e1 - e), nb, lane,
+                          [&](int j) { return xq + (size_t) ent_tok[e + j] * xb; },
+                          [&](int j, float v) { dst[(size_t) (e + j) * L.n_ff + r] = v; });
+    }
+#else
     for (int e = e0; e < e1; ++e) {
         const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
         if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
     }
+#endif
 }
 
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
@@ -397,10 +486,18 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     const uint8_t* wr = blob + L.down_off + (size_t) r * L.d_row;
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
+#if STRATA_PASCAL_TUNE
+    for (int e = e0; e < e1; e += MAX_ENT) {
+        row_dot_multi<TD>(wr, min(MAX_ENT, e1 - e), nb, lane,
+                          [&](int j) { return hq + (size_t) (e + j) * hb; },
+                          [&](int j, float v) { out[(size_t) ent_dst[e + j] * L.n_embd + r] = v; });
+    }
+#else
     for (int e = e0; e < e1; ++e) {
         const float s = row_dot<TD>(wr, hq + (size_t) e * hb, nb, lane);
         if (lane == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s;
     }
+#endif
 }
 
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
