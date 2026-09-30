@@ -26,6 +26,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/pascal_dense.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -34,6 +35,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -1108,6 +1110,9 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     if (ncols > 1) {
+        // Pascal (sm_6x): FP16 token-tiled kernel for Q8_0 / IQ4_NL, falls through when not taken
+        constexpr int ty = std::is_same_v<Weight, Q80Block> ? 8 : std::is_same_v<Weight, IQ4NLBlock> ? 20 : -1;
+        if (ty > 0 && pascal_dense_mmvq(ty, weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
         launch_multi<SmallTraits<Weight, Qi>>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
         return;
@@ -1172,6 +1177,8 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     if (ncols > 1) {
+        // Pascal (sm_6x): FP16 token-tiled kernel, falls through when not taken (see pascal_dense.hpp)
+        if (pascal_dense_mmvq(13, weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
         launch_multi<Q5KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
         return;
@@ -1290,6 +1297,8 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     if (ncols > 1) {
+        // Pascal (sm_6x): FP16 token-tiled kernel, falls through when not taken (see pascal_dense.hpp)
+        if (pascal_dense_mmvq(23, weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
         launch_multi<IQ4XSTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
         return;
@@ -1329,6 +1338,8 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     if (ncols > 1) {
+        // Pascal (sm_6x): FP16 token-tiled kernel, falls through when not taken (see pascal_dense.hpp)
+        if (pascal_dense_mmvq(12, weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
         launch_multi<Q4KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
         return;
@@ -1368,6 +1379,8 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     if (ncols > 1) {
+        // Pascal (sm_6x): FP16 token-tiled kernel, falls through when not taken (see pascal_dense.hpp)
+        if (pascal_dense_mmvq(14, weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
         launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
         return;

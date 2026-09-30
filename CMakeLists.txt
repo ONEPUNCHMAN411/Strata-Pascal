@@ -248,6 +248,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/pascal_experts.cu
+                          src/kernels/cuda/pascal_dense.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -436,6 +437,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(pascal_iq_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(pascal_iq_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME pascal_iq_parity COMMAND pascal_iq_parity)
+  # the Pascal FP16 token-tiled dense kernels (pascal_dense.cu) and the int8 multi-column path, each against an fp64
+  # reference: synthetic blocks, no model
+  add_executable(pascal_dense_parity src/kernels/pascal_dense_parity.cpp)
+  target_include_directories(pascal_dense_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(pascal_dense_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME pascal_dense_parity COMMAND pascal_dense_parity)
   if(STRATA_ENABLE_CUDA)
     # native_mmvq's multi_exact contract, bitwise: a T-column call against T single-column calls on the same Q8_1
     # bytes, with the flag off as the negative control (synthetic, GPU, no model; the control assumes 32-lane warps)

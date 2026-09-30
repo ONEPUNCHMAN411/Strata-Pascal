@@ -30,6 +30,7 @@
 // blocks of 256) each thread holds at most one block in both layouts and they coincide; its case uses n_in = 4096.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/pascal_dense.hpp"
 
 #include <cuda_runtime.h>
 
@@ -209,6 +210,9 @@ int sweep(bool exact, cudaStream_t s, Totals& t) {
 }  // namespace
 
 int main() {
+    // the contract under test is the int8 layouts': on sm_6x the FP16 token-tiled path (pascal_dense.hpp, not
+    // bitwise equal to ncols == 1 by design) would take the multi-column calls, so it is held off here
+    strata::kernels::pascal_dense_fp16_override(0);
     cudaStream_t s;
     if (!ck(cudaStreamCreate(&s), "stream create")) return 1;
 
