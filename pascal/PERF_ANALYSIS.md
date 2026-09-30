@@ -50,9 +50,7 @@ which matches upstream's own note that Pascal decode is "bounded by Pascal's per
    `verify.cpp` to skip `native_quantize_q8_1` on Pascal and pass the fp32 buffer.
 4. (Deprioritized) **Batch the per-token QSA kernels** - ~100 launches/window (~1%); the existing batched indexer
    needs host-known positions, so a correct graph-side version must keep the per-token pooling order. Not worth
-   the risk now.
-   **Batch the per-token QSA kernels** (`kv_append_q8_step`, `native_qsa_indexer_append` run once per token: 2T
-   launches per QSA layer) into one launch each.
+   the risk now. (`kv_append_q8_step` and `native_qsa_indexer_append` run once per token: 2T launches per QSA layer.)
 5. **Free knobs to A/B on the server**: `STRATA_VERIFY_DEVICE_PLAN=1`; `./setup.sh --calibrate`; `--spec 6/8`.
 6. Only then, structural ideas: both cards busy (cross-window pipelining), per-card dense weights, skip-low-weight
    misses.
