@@ -4,7 +4,8 @@
 
 Each variant is the installed config with some environment variables / engine flags changed; the rate is the median
 over calibrate.py's three prompts (128 tokens each, temperature 0) after a warm-up, as calibrate measures it.  The
-"base" variant switches off the fork's runtime-switchable changes (FP16 expert kernels, the Linux pin fix); the
+"base" variant switches off the fork's runtime-switchable changes (FP16 expert kernels, the Linux pin fix, freeing
+other stages' dense matrices); the
 compile-time ones (fused_gr one-launch tile, shared-memory grids) cannot be switched off, so "base" is not exactly
 upstream.  Results go to stdout and pascal/ab_results-<time>.json.
 """
@@ -25,7 +26,9 @@ import calibrate as CAL  # noqa: E402
 
 # name: (env overrides, flag overrides {flag: value or None to remove}, what it tests)
 VARIANTS = {
-    "base":     ({"STRATA_PASCAL_FP16": "0", "STRATA_PIN_LIMIT_GIB": "8"}, {}, "fork changes that can be switched off, off"),
+    "base":     ({"STRATA_PASCAL_FP16": "0", "STRATA_PIN_LIMIT_GIB": "8", "STRATA_SPLIT_KEEP_DENSE": "1"}, {},
+                 "fork changes that can be switched off, off"),
+    "keepdense": ({"STRATA_SPLIT_KEEP_DENSE": "1"}, {}, "fork, but every card keeps all 48 layers' dense matrices"),
     "pin":      ({"STRATA_PASCAL_FP16": "0"}, {}, "+ whole arena pinned (Linux multi-GPU fix)"),
     "fp16":     ({"STRATA_PIN_LIMIT_GIB": "8"}, {}, "+ FP16 expert kernels only"),
     "fork":     ({}, {}, "every fork change (the default)"),
