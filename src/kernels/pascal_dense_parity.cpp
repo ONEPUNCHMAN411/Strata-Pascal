@@ -145,6 +145,10 @@ bool run_case(const Ty& t, int n_in, int n_out, const std::vector<int>& cols_lis
 }  // namespace
 
 int main() {
+#if defined(__HIP_PLATFORM_AMD__)
+    std::printf("pascal_dense_parity: skipped (HIP build: the FP16 Pascal path is compiled out)\n");
+    return 0;
+#endif
     cudaStream_t s;
     CK(cudaStreamCreate(&s));
     std::mt19937 rng(20260930);
