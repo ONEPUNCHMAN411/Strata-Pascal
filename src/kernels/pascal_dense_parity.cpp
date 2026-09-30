@@ -154,6 +154,7 @@ int main() {
         {13, "Q5_K", 256, 176, {0, 2}},
         {23, "IQ4_XS", 256, 136, {0}},
         {20, "IQ4_NL", 32, 18, {0}},
+        {8, "Q8_0", 32, 34, {0}},
     };
     const std::vector<int> cols = {2, 3, 4, 6, 8};
     bool ok = true;
@@ -161,6 +162,7 @@ int main() {
         for (int n_in : {2560, 6144}) ok = run_case(t, n_in, 300, cols, rng, s) && ok;   // 300: a partial block
     // the 8-warp layout (tall matrices, the LM head)
     ok = run_case(types[0], 2560, 16400, {2, 8}, rng, s) && ok;
+    ok = run_case(types[5], 2560, 16400, {5}, rng, s) && ok;
 
     // fall-through: nothing launched, false returned
     pascal_dense_fp16_override(1);
