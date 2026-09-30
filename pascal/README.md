@@ -17,6 +17,10 @@ Upstream Strata carries an experimental Pascal build (`-DSTRATA_EXPERIMENTAL_SM6
   whole row once per token routed to the expert; now each block is visited once for all of them (up to 8, the verify
   window). Per-token sums live in shared memory so registers/occupancy stay at the baseline (ptxas: IQ3_XXS gate/up
   48 -> 46 regs, IQ4_NL down 40 -> 40).
+- **Hyper-connection read in one launch** (`fused_gr.cu`): sm_6x only launches 48 KB per block, so the 2560-float
+  tile carried 4 tokens and a 6-token verify window read the 6.6 MB `w_down` twice (96 times per window). The 1280
+  tile carries all 8; each lane keeps the same chunk order, so bit-identical.
+- `qsa.cu` (legacy attention, not the default path): the shared-memory check uses the limit Pascal actually launches.
 - Output is intended to be **bit-identical** to upstream (same terms, same order, same FMUL+FFMA). Check on the P100:
   `build-p100/pascal_iq_parity` (synthetic, no model) and, with a model fixture, `iq_parity`.
 - Not done: no measured speedup yet (no GPU here). Expected gains are modest for the expert kernels; per-token math

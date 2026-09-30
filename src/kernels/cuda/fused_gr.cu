@@ -184,13 +184,18 @@ constexpr int TILE = 1280;             // eight-token tile fits RDNA3/RDNA4's 64
 #else
 constexpr int TILE = 2560;             // xn floats per token staged at a time: 320 chunks of 8, 10 per lane
 #endif
-constexpr int TQ = TILE / 8 / 32;      // uint4 weight chunks per lane per tile
+// Pascal (sm_6x) enforces 48 KB per block, where the 2560 tile carries 4 tokens: a 6-token window then took two
+// launches and read the 6.6 MB w_down twice.  The 1280 tile (HIP's) carries all 8 in 40 KB.  Each lane still
+// visits its chunks lane + 32q in the same global order, so the sums are bitwise the 2560 tile's.
+constexpr int TILE_SMALL = 1280;
 
 // Step 2 of `gr_down_kernel` for T tokens.  One warp per row (so each lane accumulates the same chunks in the
 // same order as the single-token kernel); per tile the lane's 10 weight chunks are loaded BEFORE the activation
 // tile is staged, so the DRAM and L2 traffic are in flight together.
+template<int TILE_>
 __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
-    extern __shared__ __align__(16) float tile[];   // [T][TILE]
+    constexpr int TQ = TILE_ / 8 / 32;             // uint4 weight chunks per lane per tile
+    extern __shared__ __align__(16) float tile[];   // [T][TILE_]
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = m.T;
     const bool inject_block = blockIdx.x == DOWN_BLOCKS;
@@ -201,7 +206,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
     float acc[kFusedGrMaxT];
 #pragma unroll
     for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
-    for (int base = 0; base < D; base += TILE) {
+    for (int base = 0; base < D; base += TILE_) {
         uint4 wv[TQ];
         if (active) {
 #pragma unroll
@@ -210,8 +215,8 @@ __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
         __syncthreads();                                   // the previous tile is consumed
         const float4* src4 = reinterpret_cast<const float4*>(m.xn);
         float4* tile4 = reinterpret_cast<float4*>(tile);
-        for (int i = t; i < T * (TILE / 4); i += THREADS) {
-            const int k = i / (TILE / 4), off = i - k * (TILE / 4);
+        for (int i = t; i < T * (TILE_ / 4); i += THREADS) {
+            const int k = i / (TILE_ / 4), off = i - k * (TILE_ / 4);
             tile4[i] = src4[((size_t) k * D + base) / 4 + off];
         }
         __syncthreads();
@@ -221,7 +226,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
             const int j = lane + 32 * q;
 #pragma unroll
             for (int k = 0; k < kFusedGrMaxT; ++k)
-                if (k < T) acc[k] += dot8(wv[q], tile + k * TILE + j * 8);
+                if (k < T) acc[k] += dot8(wv[q], tile + k * TILE_ + j * 8);
         }
     }
     if (!active) return;
@@ -326,6 +331,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // runs this kernel on two cards)
     static bool attr[64] = {};
     static int chunk[64] = {};   // Turing port: tokens the down kernel may carry in one launch on this card
+    static bool small[64] = {};  // Pascal: the 1280 tile
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev >= 0 && dev < 64 && !attr[dev]) {
@@ -334,7 +340,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         int want = (int) (kFusedGrMaxT * TILE * sizeof(float));
         if (optin > 0 && want > optin) want = optin;
-        cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+        cudaFuncSetAttribute(gr_down_multi_kernel<TILE>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
         cudaGetLastError();      // drop any error the attempt left behind
         // Turing port: the down kernel stages n_tok*TILE floats of dynamic shared memory - 80 KB at the full
         // 8 tokens.  A card whose opt-in is below that (Turing: 64 KB, so 7+ tokens fail to launch as
@@ -354,14 +360,22 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&per_block, cudaDevAttrMaxSharedMemoryPerBlock, dev);
         const int usable = (cc >= 7 && optin > 0) ? optin : per_block;
+        small[dev] = cc < 7;
 #endif
-        const int capacity = usable / (int) (TILE * sizeof(float));
+        const int capacity = usable / (int) ((small[dev] ? TILE_SMALL : TILE) * sizeof(float));
         chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
         attr[dev] = true;
     }
     const int chunk_tok = (dev >= 0 && dev < 64 && chunk[dev]) ? chunk[dev] : kFusedGrMaxT;
+    const bool use_small = dev >= 0 && dev < 64 && small[dev];
+    const auto down = [&](const GrMulti& g, int nt) {
+        if (use_small)
+            gr_down_multi_kernel<TILE_SMALL><<<DOWN_BLOCKS + 1, THREADS, (size_t) nt * TILE_SMALL * sizeof(float), st>>>(g);
+        else
+            gr_down_multi_kernel<TILE><<<DOWN_BLOCKS + 1, THREADS, (size_t) nt * TILE * sizeof(float), st>>>(g);
+    };
     if (chunk_tok >= n_tok) {
-        gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
+        down(m, n_tok);
     } else {
         for (int c0 = 0; c0 < n_tok; c0 += chunk_tok) {
             const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
@@ -369,7 +383,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             c.xn = xn_scratch + (size_t) c0 * D;
             c.T = ct;
             for (int k = 0; k < ct; ++k) c.a[k] = a[c0 + k];
-            gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) ct * TILE * sizeof(float), st>>>(c);
+            down(c, ct);
         }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);

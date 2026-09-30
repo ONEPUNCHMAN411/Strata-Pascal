@@ -673,6 +673,12 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
         int dev = 0, max_shared = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+#if !defined(__HIPCC__)
+        // pre-Volta reports an opt-in it does not honour at launch (see fused_gr.cu): its per-block limit is the cap
+        int cc = 0;
+        cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, dev);
+        if (cc < 7) cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlock, dev);
+#endif
         if ((int) smem > max_shared) {
             std::fprintf(stderr, "qsa: qsa_attend: max_ids %lld needs %zu B of shared, over the %d B limit\n",
                          (long long) max_ids, smem, max_shared);
