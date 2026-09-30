@@ -29,20 +29,21 @@ Send back `~/p100-report-*.tar.gz` (or `summary.txt`). Stop other GPU services (
 
 Docs: `pascal/README.md` (setup + tuning), `pascal/PERF_ANALYSIS.md` (where time goes, ranked fixes).
 
-## In progress (NOT pushed - lost if the cloud session ends)
-1. **FP16 token-tiled dense matmuls incl. the LM head** (`pascal_dense.cu`, test `pascal_dense_parity`) - highest
-   expected win: dense GEMVs on emulated dp4a are likely the largest cost per window.
-   If gone, re-create it from PERF_ANALYSIS.md item 1.
-
-**Merged since:** token-tiled + fused (gate/up/SwiGLU) FP16 expert kernels with one-wave grids looping over the
-device-side group count (`pascal_experts.cu`, commit 95ed800): per 32 weights x 8 entries ~3.5x (gate/up) / ~4x
-(down) fewer instructions; an empty PCIe-share call is two short launches. Unrun on a GPU: `pascal_iq_parity`
-checks it (run-all.sh runs it).
+## Merged (all pushed)
+- Token-tiled + fused (gate/up/SwiGLU) FP16 expert kernels, one-wave grids over the device-side group count
+  (`pascal_experts.cu`): ~3.5x (gate/up) / ~4x (down) fewer instructions per 32 weights x 8 entries.
+- FP16 token-tiled dense matmuls incl. the LM head (`pascal_dense.cu`, hooked into `native_mmvq` for ncols 2..8):
+  Q6_K / Q4_K / Q5_K / Q8_0 / IQ4_NL / IQ4_XS; ~2.7-4.8x fewer instructions (Q6_K T=4: 852 -> 244).
+- Both unrun on a GPU; `pascal_iq_parity` and `pascal_dense_parity` check them (run-all.sh runs both).
+- Open points: (1) on Pascal, verify windows (FP16) and single-token decode (int8) now differ slightly, so
+  speculative output is no longer bitwise the plain greedy output - `STRATA_PASCAL_FP16=0` restores exactness;
+  (2) dense tile sizes / 4-vs-8-warp threshold (n_out >= 16384) are unmeasured guesses; (3) dense kernels use
+  56-80 registers (3 blocks/SM, smem-bound anyway).
 
 ## Next steps, in order
 1. Run `run-all.sh`; read `summary.txt`: per-variant tok/s, `profile.log` timing lines (GPU wait vs CPU pool vs
    staging per card), startup lines (arena pinned? PCIe probe, experts cached, hit rate).
-2. If GPU time dominates: finish items 1-2 above. If the CPU pool dominates: misses matter -> more VRAM, skip
+2. If GPU time dominates: next are kernel fusion and skipping the q8_1 quantize for FP16 paths. If the CPU pool dominates: misses matter -> more VRAM, skip
    low-weight missed experts (needs routing weights plumbed into `expert_pool_dispatch_multi`), sticky-miss ring.
 3. Then: skip the q8_1 quantize for FP16 paths (~240 kernels/window), cross-window pipelining across the two cards.
 

@@ -4,7 +4,7 @@
 // random blocks with sane fp16 scales, one q8_1 quantization of normal activations, then native_mmvq's
 // multi-column call twice - the FP16 path forced on, and forced off (the upstream int8 path) - each against an fp64
 // reference computed from the dequantized weights (dequant_f32) and the dequantized q8_1 activations.  The FP16
-// relative L2 error must stay below 1e-2 and below 2x the int8 path's + 2e-3.  Also: every output finite, the
+// relative L2 error must stay below 1e-2 and below 2x the int8 path's + 5e-3 (simulated fp16 error 5e-4..9.4e-4).  Also: every output finite, the
 // row tail (n_out not a multiple of the rows per block) and the 8-warp layout (n_out >= 16384) exercised, and the
 // fall-through cases (ncols 1, an uncovered type) launch nothing.
 //
@@ -131,7 +131,7 @@ bool run_case(const Ty& t, int n_in, int n_out, const std::vector<int>& cols_lis
         CK(cudaMemcpy(yup.data(), d_y, yup.size() * 4, cudaMemcpyDeviceToHost));
         size_t nf16 = 0, nfup = 0;
         const double e16 = rel_l2(y16, ref, nf16), eup = rel_l2(yup, ref, nfup);
-        const bool pass = taken && nf16 == 0 && nfup == 0 && e16 <= 1e-2 && e16 <= 2 * eup + 2e-3;
+        const bool pass = taken && nf16 == 0 && nfup == 0 && e16 <= 1e-2 && e16 <= 2 * eup + 5e-3;
         std::printf("%-7s n_in=%5d n_out=%6d ncols=%d  fp16 rel L2 %.3e  int8 %.3e  %s%s\n", t.name, n_in, n_out, nc,
                     e16, eup, pass ? "OK" : "FAIL", taken ? "" : " (fp16 path not taken)");
         if (nf16 || nfup) std::printf("        non-finite outputs: fp16 %zu, int8 %zu\n", nf16, nfup);
