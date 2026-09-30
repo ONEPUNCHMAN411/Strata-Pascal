@@ -36,6 +36,7 @@ VARIANTS = {
     "pciedma":  ({}, {"--pcie-mode": "dma"}, "fork + PCIe share copied by the copy engines instead of a copy kernel"),
     "pciedirect": ({}, {"--pcie-mode": "direct"}, "fork + PCIe share read in place by the expert kernels"),
     "pleram":   ({}, {"--ple-io": "ram"}, "fork + the 28.8 GB n-gram table held in RAM (no NVMe reads before a window)"),
+    "smt":      ({}, {"--pool-workers": "22"}, "fork + CPU expert workers on hyperthreads too (22 instead of 11)"),
     "spec6":    ({}, {"--spec": "6"}, "fork + verify windows up to 6 (+2 lookup)"),
     "spec8":    ({}, {"--spec": "8"}, "fork + verify windows up to 8"),
 }
