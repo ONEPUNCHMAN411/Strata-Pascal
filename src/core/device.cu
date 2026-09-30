@@ -135,10 +135,18 @@ DeviceInfo device_info(int ordinal) {
     d.arch = base_arch(p.gcnArchName);
     if (const std::string why = arch_problem(p, ordinal); !why.empty()) throw CudaError(why, -1);
 #else
-    if (d.cc_major * 10 + d.cc_minor < 75) {
+    // An -DSTRATA_EXPERIMENTAL_SM60=ON build carries the Pascal fallbacks (include/strata/kernels/dp4a.hpp), so it
+    // accepts compute capability 6.0 and up; every other build keeps the 7.5 floor.
+#if defined(STRATA_EXPERIMENTAL_SM60)
+    constexpr int kMinCc = 60;
+    const char* const kNeed = "; this Pascal build needs compute capability 6.0 or newer";
+#else
+    constexpr int kMinCc = 75;
+    const char* const kNeed = "; Strata needs compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series)";
+#endif
+    if (d.cc_major * 10 + d.cc_minor < kMinCc) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
-                            "." + std::to_string(d.cc_minor) +
-                            "; Strata needs compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series)",
+                            "." + std::to_string(d.cc_minor) + kNeed,
                         -1);
     }
 #endif

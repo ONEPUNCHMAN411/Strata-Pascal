@@ -326,6 +326,8 @@ def gpus():
 
 
 GPU_PICK = None                                         # --gpu N (issue #51); None: the card with the most VRAM
+PASCAL_MIN_ARCH = 60                                    # Strata-Pascal: sm_60 (P100) and up, compiled here with
+                                                        # -DSTRATA_EXPERIMENTAL_SM60=ON and a CUDA 12.x toolkit
 SPLIT_MIN_VRAM_GB = 8                                   # a card sharing a model holds the dense weights and its own
                                                         # prompt buffers too (docs/MULTI_GPU.md)
 
@@ -334,11 +336,15 @@ def cc(g) -> str:
     return f"{g['arch'][:-1]}.{g['arch'][-1]}"
 
 
+def is_pascal(arch) -> bool:
+    """A pre-Turing card this fork runs through the experimental sm_60 build (no ready-made engine, CUDA 12.x)."""
+    return PASCAL_MIN_ARCH <= int(arch) < 75
+
+
 def gpu_problem(g, together=False):
     """Why Strata cannot use this card, in plain words (None: it can)."""
-    if int(g["arch"]) < 75:
-        return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; Strata needs 7.5 or "
-                "newer)")
+    if int(g["arch"]) < PASCAL_MIN_ARCH:
+        return (f"not supported - older than Pascal (compute capability {cc(g)}; this build needs 6.0 or newer)")
     if together and g["vram_gb"] < SPLIT_MIN_VRAM_GB - 0.5:
         return (f"not supported together with other GPUs - {g['vram_gb']:.0f} GB of VRAM (a card sharing the model "
                 f"needs {SPLIT_MIN_VRAM_GB} GB or more)")
@@ -359,7 +365,8 @@ def gpu_table(found) -> None:
     say("  Your NVIDIA GPUs:")
     for g in found:
         p = gpu_problem(g)
-        say(f"    GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB VRAM - " + ("can be used" if p is None else p))
+        use = "can be used (experimental Pascal build, compiled here)" if is_pascal(g["arch"]) else "can be used"
+        say(f"    GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB VRAM - " + (use if p is None else p))
 
 
 def together_ok(found) -> list:
@@ -435,7 +442,7 @@ def choose_gpus(a, found) -> list:
     single = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
     if not single:
         gpu_table(found)
-        fail("none of your GPUs can run Strata", "it needs an NVIDIA RTX 20 series or newer (compute capability 7.5+)")
+        fail("none of your GPUs can run Strata", "it needs an NVIDIA GPU of compute capability 6.0+ (Pascal or newer)")
     can = together_ok(found)
     if not can:
         return [single[0]["index"]]
@@ -500,7 +507,8 @@ def gpu_info(pick=None):
     return {**g, "count": len(found)}
 
 
-def find_nvcc():
+def find_nvcc(below=None):
+    """The newest nvcc found, or the newest older than `below` (a (major, minor)) when one is given."""
     cands = [shutil.which("nvcc")]
     if os.environ.get("CUDA_PATH"):
         cands.append(str(Path(os.environ["CUDA_PATH"]) / "bin" / ("nvcc.exe" if WIN else "nvcc")))
@@ -515,6 +523,8 @@ def find_nvcc():
     for c in dict.fromkeys(cands):                     # every toolkit found; the newest wins
         if c and Path(c).exists():
             v = re.search(r"release (\d+)\.(\d+)", out([c, "--version"]))
+            if v and below is not None and (int(v.group(1)), int(v.group(2))) >= below:
+                continue
             if v and (best[1] is None or (int(v.group(1)), int(v.group(2))) > best[1]):
                 best = (c, (int(v.group(1)), int(v.group(2))))
     return best
@@ -1034,16 +1044,24 @@ def update_installed_engine(url_base) -> None:
 
 def install_build_tools(gpu, yes):
     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
-    nvcc, cuda_v = find_nvcc()
+    archs = [int(x) for x in gpu.get("archs", [gpu["arch"]])]
+    # Pascal (sm_6x): CUDA 13 removed it, so a 12.x toolkit - and never one alongside an RTX 50 (it needs 13.0)
+    pascal = any(is_pascal(x) for x in archs)
+    if pascal and max(archs) >= 120:
+        fail("a Pascal card and an RTX 50 card cannot share one engine (Pascal needs CUDA 12.x, RTX 50 needs 13.0)",
+             "pick cards of one kind with --gpus / --gpu")
+    below = (13, 0) if pascal else None
+    cuda_pkg, cuda_label = ("12-8", "12.8") if pascal else ("13-0", "13.0")
+    nvcc, cuda_v = find_nvcc(below)
     # RTX 50 (sm_120): CUDA 13.0 - an engine built with 12.8 crashed in the prompt path on Linux (#220)
-    need_cuda = (13, 0) if max(int(x) for x in gpu.get("archs", [gpu["arch"]])) >= 120 else (12, 0)
+    need_cuda = (13, 0) if max(archs) >= 120 else (12, 0)
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
     missing = []
     if not have_cc:
         missing.append("Visual Studio 2022 Build Tools (C++)" if WIN else "the C++ compiler (build-essential)")
     if nvcc is None or cuda_v < need_cuda:
-        missing.append("the NVIDIA CUDA Toolkit 13.0")
+        missing.append(f"the NVIDIA CUDA Toolkit {cuda_label}")
     if not missing:
         ok(f"build tools present (CUDA {cuda_v[0]}.{cuda_v[1]})")
         return nvcc, vcvars
@@ -1063,7 +1081,7 @@ def install_build_tools(gpu, yes):
                  "--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"],
                 check=False)
         if nvcc is None or cuda_v < need_cuda:
-            run([*wg, "--id", "Nvidia.CUDA", "--version", "13.0"], check=False)
+            run([*wg, "--id", "Nvidia.CUDA", "--version", cuda_label], check=False)
         vcvars = find_vcvars()
     else:
         apt = shutil.which("apt-get")
@@ -1084,8 +1102,8 @@ def install_build_tools(gpu, yes):
                      deb, "CUDA repository key")
             run(["sudo", "dpkg", "-i", str(deb)])
             run(["sudo", "apt-get", "update"])
-            run(["sudo", "apt-get", "install", "-y", "cuda-toolkit-13-0"])
-    nvcc, cuda_v = find_nvcc()
+            run(["sudo", "apt-get", "install", "-y", f"cuda-toolkit-{cuda_pkg}"])
+    nvcc, cuda_v = find_nvcc(below)
     if (WIN and find_vcvars() is None) or (not WIN and shutil.which("g++") is None):
         fail("the C++ build tools did not install", "install them by hand (README.md) and run it again")
     if nvcc is None or cuda_v < need_cuda:
@@ -1156,6 +1174,7 @@ def build_engine(gpu, vision, yes, llama) -> Path:
         archs = sorted(built | set(archs))
     nvcc, vcvars = install_build_tools({**gpu, "archs": archs}, yes)
     cuda_archs = ";".join(str(x) for x in archs)
+    pascal = ["-DSTRATA_EXPERIMENTAL_SM60=ON"] if any(is_pascal(x) for x in archs) else []
     if not engine_ok:
         say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) + " (a card it had no code for; "
             "10-20 minutes, once) ..." if new_arch else
@@ -1163,7 +1182,7 @@ def build_engine(gpu, vision, yes, llama) -> Path:
             if local and (eng / EXE).exists() else "  Compiling the Strata engine for your GPU (10-20 minutes, once) ...")
         cmake_build(ROOT, ROOT / "build", "strata",
                     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
-                     f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata.bat")
+                     f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}", *pascal], vcvars, "build-strata.bat")
         shutil.copy2(ROOT / "build" / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
@@ -2115,7 +2134,9 @@ def main() -> int:
     step(4, "the Strata engine")
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-    eng = None if a.build or hip else get_prebuilt(a.prebuilt, gpu, vision)
+    # Pascal: the ready-made engine has no sm_6x code, so it is always compiled here
+    pascal = not hip and any(is_pascal(x) for x in gpu.get("archs", [gpu["arch"]]))
+    eng = None if a.build or hip or pascal else get_prebuilt(a.prebuilt, gpu, vision)
     if eng is not None and json.loads((eng / "BUILD.json").read_text()).get("source") != "local":
         pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
         if vision != "none" and not (eng / VEXE).exists():
