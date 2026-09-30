@@ -1,5 +1,12 @@
 # Strata on Tesla P100 (sm_60)
 
+**One command on the server** (update, hardware report, install/compile IQ3_S on both cards, GPU correctness tests,
+calibration, A/B benchmark of every change, a profiled request; ~1-2 h plus the first download):
+
+    cd ~/Strata-Pascal && ./pascal/run-all.sh
+
+It ends by printing a `~/p100-report-*.tar.gz` to send back.
+
 Upstream Strata carries an experimental Pascal build (`-DSTRATA_EXPERIMENTAL_SM60=ON`, commit `01bca8a`). This fork adds:
 
 - `setup.py`: accepts compute capability 6.x cards, always compiles for them (no ready-made sm_6x engine), and uses a

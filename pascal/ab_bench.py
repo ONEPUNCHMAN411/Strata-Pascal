@@ -58,9 +58,14 @@ def main() -> int:
     ap.add_argument("config", nargs="?")
     ap.add_argument("--variants", default=",".join(VARIANTS), help="comma list of: " + ", ".join(VARIANTS))
     ap.add_argument("--rounds", type=int, default=2, help="measurements per variant (median taken)")
+    ap.add_argument("--out", help="folder for the results and one engine log per variant (default: pascal/)")
+    ap.add_argument("--profile", action="store_true",
+                    help="afterwards, one 512-token request with the engine's timing output on (profile.log)")
     a = ap.parse_args()
     cfg_path = Path(a.config) if a.config else newest_config()
     cfg = json.loads(cfg_path.read_text())
+    out_dir = Path(a.out) if a.out else ROOT / "pascal"
+    out_dir.mkdir(parents=True, exist_ok=True)
     from serve.server import StrataEngine, child_env
     ids_list = [CAL.chat_ids(tokenizer(cfg), p) for p in CAL.PROMPTS]
     base_args = list(cfg["args"])
@@ -80,8 +85,10 @@ def main() -> int:
         env.update(env_over)
         print(f"[{name}] {what} ...", flush=True)
         t0 = time.time()
-        eng = StrataEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
+        log = str(out_dir / f"engine-{name}.log")
+        eng = None
         try:
+            eng = StrataEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=log, env=env)
             s = CAL.Session(eng, ids_list)
             s.warm_up(1)
             rates = [s.rate() for _ in range(a.rounds)]
@@ -90,7 +97,8 @@ def main() -> int:
             results[name] = {"error": str(e)}
             continue
         finally:
-            CAL.close(eng)
+            if eng is not None:
+                CAL.close(eng)
         results[name] = {"tok_s": round(statistics.median(rates), 2), "rates": [round(r, 2) for r in rates],
                          "seconds": round(time.time() - t0)}
         print(f"  {results[name]['tok_s']:.2f} tok/s  (rounds {results[name]['rates']})", flush=True)
@@ -100,10 +108,33 @@ def main() -> int:
         if "tok_s" in r:
             rel = f"{(r['tok_s'] / base - 1) * 100:+.1f}%" if base else "-"
             print(f"{name:<10} {r['tok_s']:>6.2f}   {rel}")
-    out = ROOT / "pascal" / f"ab_results-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    out = out_dir / f"ab_results-{time.strftime('%Y%m%d-%H%M%S')}.json"
     out.write_text(json.dumps({"config": cfg_path.name, "results": results}, indent=1))
     print(f"\nsaved {out}")
+    if a.profile:
+        profile(cfg, base_args, ids_list[0], out_dir, StrataEngine, child_env)
     return 0
+
+
+def profile(cfg, args, ids, out_dir: Path, StrataEngine, child_env):
+    """One long request with the engine's per-window timing on: where the time goes (see PERF_ANALYSIS.md)."""
+    import threading
+    env = child_env(cfg)
+    env.update({"STRATA_DECODE_TIMING": "1", "STRATA_SPLIT_TIMING": "1", "STRATA_VERIFY_PROFILE": "1"})
+    log = out_dir / "profile.log"
+    print(f"[profile] 512 tokens with timing output -> {log.name} ...", flush=True)
+    eng = None
+    try:
+        eng = StrataEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=str(log), env=env)
+        CAL.Session(eng, [ids]).warm_up(1)
+        n = sum(1 for t in eng.generate(ids, 512, {"temperature": 0}, threading.Event()) if t is not None)
+        ms = (eng.last or {}).get("decode_ms") or 0.0
+        print(f"  {n} tokens, {n / (ms / 1000.0):.2f} tok/s" if ms else f"  {n} tokens", flush=True)
+    except Exception as e:
+        print(f"  profile failed: {e}")
+    finally:
+        if eng is not None:
+            CAL.close(eng)
 
 
 if __name__ == "__main__":
