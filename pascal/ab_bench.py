@@ -42,6 +42,10 @@ VARIANTS = {
 }
 
 
+# the switchable options measured on top of the fork default (combined at the end when they win)
+OPTIONS = ("devplan", "pciedma", "pciedirect", "pleram", "smt", "spec6", "spec8")
+
+
 def newest_config() -> Path:
     cands = sorted(ROOT.glob("strata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not cands:
@@ -66,6 +70,8 @@ def main() -> int:
     ap.add_argument("--variants", default=",".join(VARIANTS), help="comma list of: " + ", ".join(VARIANTS))
     ap.add_argument("--rounds", type=int, default=2, help="measurements per variant (median taken)")
     ap.add_argument("--out", help="folder for the results and one engine log per variant (default: pascal/)")
+    ap.add_argument("--apply", action="store_true",
+                    help="write the recommended options into the config (a .bak copy is kept) when they beat the default")
     ap.add_argument("--profile", action="store_true",
                     help="afterwards, one 512-token request with the engine's timing output on (profile.log)")
     a = ap.parse_args()
@@ -80,11 +86,8 @@ def main() -> int:
         base_args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     print(f"config {cfg_path.name}; {len(ids_list)} prompts x {CAL.MAX_NEW} tokens; {a.rounds} rounds per variant")
     results = {}
-    for name in [v.strip() for v in a.variants.split(",") if v.strip()]:
-        if name not in VARIANTS:
-            print(f"  unknown variant {name!r}, skipped")
-            continue
-        env_over, flag_over, what = VARIANTS[name]
+
+    def run_variant(name, env_over, flag_over, what):
         args = list(base_args)
         for f, v in flag_over.items():
             args = CAL.with_arg(args, f, v)
@@ -102,17 +105,59 @@ def main() -> int:
         except Exception as e:                          # a variant that fails to start or run is reported, not fatal
             print(f"  failed: {e}")
             results[name] = {"error": str(e)}
-            continue
+            return
         finally:
             if eng is not None:
                 CAL.close(eng)
         results[name] = {"tok_s": round(statistics.median(rates), 2), "rates": [round(r, 2) for r in rates],
                          "seconds": round(time.time() - t0)}
         print(f"  {results[name]['tok_s']:.2f} tok/s  (rounds {results[name]['rates']})", flush=True)
+
+    for name in [v.strip() for v in a.variants.split(",") if v.strip()]:
+        if name not in VARIANTS:
+            print(f"  unknown variant {name!r}, skipped")
+            continue
+        run_variant(name, *VARIANTS[name])
+
+    # every "fork + X" option that beat the fork default by more than MIN_GAIN, together (the better of spec6/8)
+    fork = (results.get("fork") or {}).get("tok_s")
+    if fork:
+        wins = [n for n in OPTIONS if (results.get(n) or {}).get("tok_s", 0) > fork * (1 + CAL.MIN_GAIN)]
+        for x, y in (("spec6", "spec8"), ("pciedma", "pciedirect")):   # the same flag: keep the better one
+            if x in wins and y in wins:
+                wins.remove(x if results[x]["tok_s"] < results[y]["tok_s"] else y)
+        if len(wins) >= 2:
+            env_c, flags_c = {}, {}
+            for n in wins:
+                env_c.update(VARIANTS[n][0])
+                flags_c.update(VARIANTS[n][1])
+            run_variant("best", env_c, flags_c, "fork + " + " + ".join(wins))
+        elif wins:
+            env_c, flags_c = VARIANTS[wins[0]][0], VARIANTS[wins[0]][1]
+        if wins:
+            best = "best" if len(wins) >= 2 else wins[0]
+            print(f"\nrecommended: {' + '.join(wins)} -> in {cfg_path.name}:")
+            if flags_c:
+                print("  \"args\": add " + ", ".join(f'"{k}", "{v}"' for k, v in flags_c.items()))
+            if env_c:
+                print("  \"env\": " + json.dumps(env_c))
+            best_rate = (results.get(best) or {}).get("tok_s") or 0
+            results["recommended"] = {"options": wins, "flags": flags_c, "env": env_c, "tok_s": best_rate}
+            if a.apply and best_rate > fork * (1 + CAL.MIN_GAIN):
+                bak = cfg_path.with_name(cfg_path.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+                bak.write_text(cfg_path.read_text())
+                new_cfg = json.loads(cfg_path.read_text())
+                for k, v in flags_c.items():
+                    new_cfg["args"] = CAL.with_arg(new_cfg["args"], k, v)
+                new_cfg["env"] = {**(new_cfg.get("env") or {}), **env_c}
+                cfg_path.write_text(json.dumps(new_cfg, indent=1))
+                print(f"  applied to {cfg_path.name} (previous config saved as {bak.name})")
+        else:
+            print("\nrecommended: the defaults (no option beat them by more than 3%)")
     base = (results.get("base") or {}).get("tok_s")
     print("\nvariant    tok/s    vs base")
     for name, r in results.items():
-        if "tok_s" in r:
+        if "tok_s" in r and name != "recommended":
             rel = f"{(r['tok_s'] / base - 1) * 100:+.1f}%" if base else "-"
             print(f"{name:<10} {r['tok_s']:>6.2f}   {rel}")
     out = out_dir / f"ab_results-{time.strftime('%Y%m%d-%H%M%S')}.json"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Everything on the P100 server in one go: update, hardware report, build + GPU correctness tests, install/update
-# IQ3_S across both cards, calibrate, A/B benchmark of every change, one profiled request - into one report folder.
+# IQ3_S across both cards, calibrate, A/B benchmark of every change (the winning options are saved into the config,
+# with a backup), one profiled request - into one report folder.
 #
 #   cd ~/Strata-Pascal && ./pascal/run-all.sh
 #
@@ -44,7 +45,7 @@ if (( ok )); then
   ./setup.sh --calibrate --build --yes --no-start || echo "!! calibration failed - benchmarking with defaults"
 
   step "6/7 A/B benchmark of every change + profiled request"
-  .venv/bin/python pascal/ab_bench.py --out "$R" --profile || echo "!! benchmark failed"
+  .venv/bin/python pascal/ab_bench.py --out "$R" --profile --apply || echo "!! benchmark failed"
 fi
 
 step "7/7 collect"
