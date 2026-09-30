@@ -37,13 +37,21 @@ VARIANTS = {
     "pciedirect": ({}, {"--pcie-mode": "direct"}, "fork + PCIe share read in place by the expert kernels"),
     "pleram":   ({}, {"--ple-io": "ram"}, "fork + the 28.8 GB n-gram table held in RAM (no NVMe reads before a window)"),
     "smt":      ({}, {"--pool-workers": "22"}, "fork + CPU expert workers on hyperthreads too (22 instead of 11)"),
+    "specsplit": ({}, {"--spec-split": True}, "fork + split windows: CPU experts of one half overlap the GPU's other half"),
     "spec6":    ({}, {"--spec": "6"}, "fork + verify windows up to 6 (+2 lookup)"),
     "spec8":    ({}, {"--spec": "8"}, "fork + verify windows up to 8"),
 }
 
 
 # the switchable options measured on top of the fork default (combined at the end when they win)
-OPTIONS = ("devplan", "pciedma", "pciedirect", "pleram", "smt", "spec6", "spec8")
+OPTIONS = ("devplan", "pciedma", "pciedirect", "pleram", "smt", "specsplit", "spec6", "spec8")
+
+
+def set_flag(args: list[str], flag: str, value) -> list[str]:
+    """`flag value`, or a bare boolean `flag` when value is True."""
+    if value is True:
+        return args if flag in args else args + [flag]
+    return CAL.with_arg(args, flag, value)
 
 
 def newest_config() -> Path:
@@ -90,7 +98,7 @@ def main() -> int:
     def run_variant(name, env_over, flag_over, what):
         args = list(base_args)
         for f, v in flag_over.items():
-            args = CAL.with_arg(args, f, v)
+            args = set_flag(args, f, v)
         env = child_env(cfg)
         env.update(env_over)
         print(f"[{name}] {what} ...", flush=True)
@@ -138,7 +146,7 @@ def main() -> int:
             best = "best" if len(wins) >= 2 else wins[0]
             print(f"\nrecommended: {' + '.join(wins)} -> in {cfg_path.name}:")
             if flags_c:
-                print("  \"args\": add " + ", ".join(f'"{k}", "{v}"' for k, v in flags_c.items()))
+                print("  \"args\": add " + ", ".join(f'"{k}"' if v is True else f'"{k}", "{v}"' for k, v in flags_c.items()))
             if env_c:
                 print("  \"env\": " + json.dumps(env_c))
             best_rate = (results.get(best) or {}).get("tok_s") or 0
@@ -148,7 +156,7 @@ def main() -> int:
                 bak.write_text(cfg_path.read_text())
                 new_cfg = json.loads(cfg_path.read_text())
                 for k, v in flags_c.items():
-                    new_cfg["args"] = CAL.with_arg(new_cfg["args"], k, v)
+                    new_cfg["args"] = set_flag(new_cfg["args"], k, v)
                 new_cfg["env"] = {**(new_cfg.get("env") or {}), **env_c}
                 cfg_path.write_text(json.dumps(new_cfg, indent=1))
                 print(f"  applied to {cfg_path.name} (previous config saved as {bak.name})")
