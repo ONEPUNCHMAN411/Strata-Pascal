@@ -78,5 +78,8 @@ Optional:
   `"--dump-routing", "routing.bin"` for a while, then `python tools/make_profile.py` (see its header) and point
   `--expert-profile` at the result.
 
+Measure every change at once: `.venv/bin/python pascal/ab_bench.py` restarts the engine once per variant (base =
+fork's switchable changes off, pin, fp16, fork, devplan, spec6, spec8) and prints tok/s per variant vs base.
+
 Where the time goes (send me this): add `"env": {"STRATA_DECODE_TIMING": "1", "STRATA_SPLIT_TIMING": "1"}` to the
 config, send one ~500-token request, and copy the per-window timing lines (GPU wait vs CPU pool vs staging per card).

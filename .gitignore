@@ -50,3 +50,4 @@ build-vision.bat
 /third_party/*.zip
 
 .claude/worktrees/
+pascal/ab_results-*.json
