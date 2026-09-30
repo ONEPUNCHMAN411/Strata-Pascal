@@ -31,6 +31,7 @@ drafter drafts the next window token by token.
 | 3 | **Kernel launch/latency floor** | ~2,500 dependent kernels per window; Pascal has no fast graph launch path, ~3-5 us each even when tiny | ~8-12 ms | fusion (below) |
 | 4 | **LM head** (248,320 x 2560, Q6_K = 520 MB) | read once per window and multiplied against T tokens on the emulated path, on the last card | ~3-6 ms | covered by FP16 dense (Q6_K) |
 | 5 | **CPU experts on misses** | the GPU waits for the CPU rows before combining; Haswell AVX2 at DDR3-1600 | 0-10 ms, depends on hit rate | pin fix (done: PCIe share now possible on all layers), skip-low-weight misses, more VRAM |
+| 5b | **Empty expert grids** | `native_expert_grouped` runs twice per layer (VRAM share, then the PCIe share, usually empty) with grid.y = T x 10 possible groups; unused blocks start and exit. int8 path: up to ~24,000 blocks per empty call, FP16 path ~6,000 | ~0.5-2.5 ms | grid-stride loop over the device-side group count (expert agent) |
 | 6 | **Per-layer host round trip** | doorbell -> host plan -> flag, polled over PCIe, x48 | ~1-3 ms | `STRATA_VERIFY_DEVICE_PLAN=1` (exists, off by default) plans all-resident layers on the GPU |
 | 7 | **Drafting** (MTP layer per draft token, sequential) | ~T small forward passes after each window | ~1-3 ms | fine for now |
 | 8 | **Card hand-off + commit** | stream sync, host copy, second graph launch | ~0.5-1 ms | pipelining idea (large) |
@@ -47,7 +48,10 @@ which matches upstream's own note that Pascal decode is "bounded by Pascal's per
 3. **Skip the q8_1 quantize for FP16 paths**: the FP16 kernels re-expand the int8 activation to half; reading the
    fp32 activation directly removes ~5 quantize kernels per layer (~240 per window) and is more precise. Needs
    `verify.cpp` to skip `native_quantize_q8_1` on Pascal and pass the fp32 buffer.
-4. **Batch the per-token QSA kernels** (`kv_append_q8_step`, `native_qsa_indexer_append` run once per token: 2T
+4. (Deprioritized) **Batch the per-token QSA kernels** - ~100 launches/window (~1%); the existing batched indexer
+   needs host-known positions, so a correct graph-side version must keep the per-token pooling order. Not worth
+   the risk now.
+   **Batch the per-token QSA kernels** (`kv_append_q8_step`, `native_qsa_indexer_append` run once per token: 2T
    launches per QSA layer) into one launch each.
 5. **Free knobs to A/B on the server**: `STRATA_VERIFY_DEVICE_PLAN=1`; `./setup.sh --calibrate`; `--spec 6/8`.
 6. Only then, structural ideas: both cards busy (cross-window pipelining), per-card dense weights, skip-low-weight
