@@ -6,6 +6,7 @@
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
+#include "strata/kernels/pascal_experts.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -809,6 +810,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
+    // sm_6x: the FP16 kernels for the IQ3_S model's formats (pascal_experts.cu); false = not this card / types
+    if (pascal_expert_grouped(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
+                              scratch, out, stream))
+        return;
     cudaStream_t s = (cudaStream_t) stream;
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;

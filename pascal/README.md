@@ -21,7 +21,15 @@ Upstream Strata carries an experimental Pascal build (`-DSTRATA_EXPERIMENTAL_SM6
   tile carried 4 tokens and a 6-token verify window read the 6.6 MB `w_down` twice (96 times per window). The 1280
   tile carries all 8; each lane keeps the same chunk order, so bit-identical.
 - `qsa.cu` (legacy attention, not the default path): the shared-memory check uses the limit Pascal actually launches.
-- Output is intended to be **bit-identical** to upstream (same terms, same order, same FMUL+FFMA). Check on the P100:
+- **FP16 expert kernels** (`src/kernels/cuda/pascal_experts.cu`, on by default on sm_6x; `STRATA_PASCAL_FP16=0` turns
+  them off for A/B): the IQ3_S model's expert formats (gate/up IQ3_XXS, IQ3_S, IQ2_S; down IQ4_NL, Q2_0) decoded
+  to half2 and multiplied with HFMA2 (P100: 2x the fp32 rate, no dp4a). Codebooks pre-converted to fp16 in shared
+  memory; IQ4_NL via a byte -> half2 table against an interleaved activation. Static SASS per row vs the int8 path:
+  IQ3_XXS ~1.45x, IQ3_S ~1.25x, IQ2_S ~1.15x fewer instructions, IQ4_NL down ~2x. **Not bit-exact**: fp16 products,
+  sums of 32 in fp16 then fp32; the down projection reads the fp32 SwiGLU output at 11-bit precision instead of int8.
+  `pascal_iq_parity` reports both paths' error against an fp64 reference and fails if fp16 is > 2x the int8 error.
+  Layers with other types (the one IQ4_XS gate/up layer) keep the int8 kernels.
+- Output of the other changes is intended to be **bit-identical** to upstream (same terms, same order, same FMUL+FFMA). Check on the P100:
   `build-p100/pascal_iq_parity` (synthetic, no model) and, with a model fixture, `iq_parity`.
 - Not done: no measured speedup yet (no GPU here). Expected gains are modest for the expert kernels; per-token math
   suggests decode time is dominated by kernel latency / host sync, so profile with

@@ -4,9 +4,12 @@
 //      entries) must equal, bitwise, the same entries each in a group of its own.
 //   2. iq_mmvq (the grid read from shared memory on sm_6x) must match the dequantized matrix (grid read from global
 //      memory) times the dequantized q8_1 activation, within the activation rounding.
+//   3. The FP16 expert path (pascal_experts.cu) and the int8 path, each against an fp64 reference computed from the
+//      dequantized weights: the FP16 error must stay small and not exceed the int8 path's by much.
 //
 // Runs on any CUDA card; on RTX builds it checks the upstream code paths the same way.
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/pascal_experts.hpp"
 
 #include <cuda_runtime.h>
 
@@ -180,6 +183,96 @@ bool mmvq_test(int ty, std::mt19937& rng) {
     return ok;
 }
 
+bool fp16_quality_test(int gu, int dn, std::mt19937& rng) {
+    const int T = 3;
+    const NativeExpertLayout L = native_expert_layout(gu, dn, N_EMBD, N_FF);
+    auto a = random_rows(gu, 2 * N_FF, N_EMBD, rng);
+    auto b = random_rows(dn, N_EMBD, N_FF, rng);
+    std::vector<uint8_t> blob(a);
+    blob.insert(blob.end(), b.begin(), b.end());
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x((size_t) T * N_EMBD);
+    for (auto& v : x) v = nd(rng);
+    uint8_t* d_blob; float *d_x, *d_out, *d_w; void *d_xq, *d_scr; int32_t* d_i; unsigned long long* d_p;
+    CK(cudaMalloc(&d_blob, blob.size()));
+    CK(cudaMemcpy(d_blob, blob.data(), blob.size(), cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&d_x, x.size() * 4));
+    CK(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&d_xq, (size_t) T * (N_EMBD / 32) * 36));
+    quantize_q8_1_rows(d_x, T, N_EMBD, d_xq, nullptr);
+    CK(cudaMalloc(&d_scr, native_expert_scratch_bytes(T, N_FF)));
+    CK(cudaMalloc(&d_out, (size_t) T * N_EMBD * 4));
+    CK(cudaMalloc(&d_w, (size_t) 3 * N_FF * N_EMBD * 4));
+    CK(cudaMalloc(&d_i, 64));
+    CK(cudaMalloc(&d_p, 8));
+    const unsigned long long p = (unsigned long long) d_blob;
+    // one group, all T tokens: [n_groups | start 0, T | dst 0..T-1 | tok 0..T-1]
+    std::vector<int32_t> ints = {1, 0, T};
+    for (int i = 0; i < T; ++i) ints.push_back(i);
+    for (int i = 0; i < T; ++i) ints.push_back(i);
+    CK(cudaMemcpy(d_i, ints.data(), ints.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_p, &p, 8, cudaMemcpyHostToDevice));
+    auto run = [&](int fp16) {
+        pascal_expert_fp16_override(fp16);
+        native_expert_grouped(L, d_p, d_i + 1, d_i, d_i + 3, d_i + 3 + T, 1, T, d_xq, d_scr, d_out, nullptr);
+        CK(cudaDeviceSynchronize());
+        std::vector<float> o((size_t) T * N_EMBD);
+        CK(cudaMemcpy(o.data(), d_out, o.size() * 4, cudaMemcpyDeviceToHost));
+        return o;
+    };
+    const auto o_int = run(0), o_fp16 = run(1);
+    pascal_expert_fp16_override(-1);
+    // fp64 reference: dequantized weights, the q8_1 activation the kernels read, SwiGLU unquantized
+    std::vector<float> wgu((size_t) 2 * N_FF * N_EMBD), wd((size_t) N_EMBD * N_FF);
+    iq_dequant_f32(gu, d_blob, (int64_t) wgu.size(), d_w, nullptr);
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(wgu.data(), d_w, wgu.size() * 4, cudaMemcpyDeviceToHost));
+    iq_dequant_f32(dn, d_blob + L.down_off, (int64_t) wd.size(), d_w, nullptr);
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(wd.data(), d_w, wd.size() * 4, cudaMemcpyDeviceToHost));
+    std::vector<uint8_t> xq((size_t) T * (N_EMBD / 32) * 36);
+    CK(cudaMemcpy(xq.data(), d_xq, xq.size(), cudaMemcpyDeviceToHost));
+    auto h2f = [](uint16_t h) {
+        const int e = (h >> 10) & 0x1F, m = h & 0x3FF;
+        const float v = e == 0 ? std::ldexp((float) m, -24) : std::ldexp((float) (m | 0x400), e - 25);
+        return (h & 0x8000) ? -v : v;
+    };
+    double e_int = 0, e_fp16 = 0, nref = 0;
+    for (int t = 0; t < T; ++t) {
+        std::vector<double> xd(N_EMBD), hh(N_FF);
+        for (int i = 0; i < N_EMBD; ++i) {
+            const uint8_t* blk = &xq[((size_t) t * (N_EMBD / 32) + i / 32) * 36];
+            uint16_t d16;
+            std::memcpy(&d16, blk, 2);
+            xd[i] = (double) h2f(d16) * (int8_t) blk[4 + i % 32];
+        }
+        for (int r = 0; r < N_FF; ++r) {
+            double g = 0, u = 0;
+            for (int i = 0; i < N_EMBD; ++i) {
+                g += wgu[(size_t) r * N_EMBD + i] * xd[i];
+                u += wgu[(size_t) (N_FF + r) * N_EMBD + i] * xd[i];
+            }
+            hh[r] = g / (1.0 + std::exp(-g)) * u;
+        }
+        for (int r = 0; r < N_EMBD; ++r) {
+            double o = 0;
+            for (int i = 0; i < N_FF; ++i) o += wd[(size_t) r * N_FF + i] * hh[i];
+            const size_t k = (size_t) t * N_EMBD + r;
+            e_int += (o_int[k] - o) * (o_int[k] - o);
+            e_fp16 += (o_fp16[k] - o) * (o_fp16[k] - o);
+            nref += o * o;
+        }
+    }
+    e_int = std::sqrt(e_int / nref);
+    e_fp16 = std::sqrt(e_fp16 / nref);
+    const bool ok = std::isfinite(e_fp16) && e_fp16 < 1e-2 && e_fp16 < 2.0 * e_int + 2e-3;
+    std::printf("fp16     gu=%2d down=%2d  rel. L2 error vs fp64: int8 path %.2e, fp16 path %.2e  %s\n", gu, dn, e_int,
+                e_fp16, ok ? "OK" : "FAIL");
+    cudaFree(d_blob); cudaFree(d_x); cudaFree(d_out); cudaFree(d_w); cudaFree(d_xq); cudaFree(d_scr);
+    cudaFree(d_i); cudaFree(d_p);
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -193,6 +286,8 @@ int main() {
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42}) fail += !grouped_test(gu, 20, rng);
     fail += !grouped_test(18, 42, rng);   // (IQ4_XS down needs n_ff % 256 == 0; the model's 640 is not)
     for (int ty : {16, 17, 18, 20, 21, 22, 23, 29, 42}) fail += !mmvq_test(ty, rng);
+    for (int gu : {18, 21, 22})
+        for (int dn : {20, 42}) fail += !fp16_quality_test(gu, dn, rng);
     std::printf("%s (%d failed)\n", fail ? "FAIL" : "PASS", fail);
     return fail ? 1 : 0;
 }
