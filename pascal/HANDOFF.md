@@ -29,13 +29,15 @@ Send back `~/p100-report-*.tar.gz` (or `summary.txt`). Stop other GPU services (
 
 Docs: `pascal/README.md` (setup + tuning), `pascal/PERF_ANALYSIS.md` (where time goes, ranked fixes).
 
-## In progress when this was written (NOT pushed - lost if the cloud session ends)
-Two agents in local worktrees:
+## In progress (NOT pushed - lost if the cloud session ends)
 1. **FP16 token-tiled dense matmuls incl. the LM head** (`pascal_dense.cu`, test `pascal_dense_parity`) - highest
    expected win: dense GEMVs on emulated dp4a are likely the largest cost per window.
-2. **Token-tiled + fused (gate/up/SwiGLU) expert kernels, grid-stride over groups** (`pascal_experts.cu`) - removes
-   re-decoding per token and thousands of empty blocks per layer.
-If they are gone, re-create them from the task descriptions above (PERF_ANALYSIS.md items 1, 2, 5b).
+   If gone, re-create it from PERF_ANALYSIS.md item 1.
+
+**Merged since:** token-tiled + fused (gate/up/SwiGLU) FP16 expert kernels with one-wave grids looping over the
+device-side group count (`pascal_experts.cu`, commit 95ed800): per 32 weights x 8 entries ~3.5x (gate/up) / ~4x
+(down) fewer instructions; an empty PCIe-share call is two short launches. Unrun on a GPU: `pascal_iq_parity`
+checks it (run-all.sh runs it).
 
 ## Next steps, in order
 1. Run `run-all.sh`; read `summary.txt`: per-variant tok/s, `profile.log` timing lines (GPU wait vs CPU pool vs
