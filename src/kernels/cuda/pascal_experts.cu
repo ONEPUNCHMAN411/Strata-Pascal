@@ -2,6 +2,13 @@
 //
 // Block layouts and codebooks are llama.cpp's (ggml-common.h, via iq_kernels.cu's include); each decoder below
 // follows the matching vec_dot_*_q8_1 in iq_kernels.cu index for index, with the int8 dp4a replaced by half2 FMA.
+//
+// Token tiling: a group is one expert and its entries are the verify window's tokens routed to it (1..8).  Every
+// 32-value weight sub-block is loaded and decoded to half2 ONCE and multiplied against all entries of the group
+// (in chunks of up to NE_MAX entries, the chunk size a template parameter so a 1-entry group runs the 1-entry code).
+// The entries' activations are staged in shared memory a K-slice at a time (gate/up: 512 values of every entry of
+// the chunk, 1 KB each; down: the whole 640, 1.25 KB each), in a [entry][quarter][sub-block] uint4 layout so the
+// lanes of a warp read consecutive 16-byte words.
 #include "strata/kernels/pascal_experts.hpp"
 
 #if defined(__HIPCC__)
@@ -33,8 +40,21 @@ constexpr int H = 2560;          // n_embd
 constexpr int FF = 640;          // expert n_ff
 constexpr int THREADS = 256;
 constexpr int WARPS = THREADS / 32;
-constexpr int GU_ROWS = 32;      // rows per block (4 per warp): the staged activation serves 32 rows
-constexpr int D_ROWS = 32;
+constexpr int NE_MAX = 8;        // entries per chunk: a verify window's tokens (a group with more runs in chunks)
+
+// gate/up: lanes 0-15 of a warp take gate row r, lanes 16-31 up row r; per staged K-slice each lane owns one
+// 32-value sub-block of each of the warp's rows
+constexpr int SLICE = 512;                     // K values per staging round
+constexpr int SLICE_SB = SLICE / 32;           // 16 sub-blocks: one per half-warp lane
+constexpr int N_SLICE = H / SLICE;             // 5
+constexpr int GU_RPW = 1;                      // row pairs (gate r, up r) per warp
+constexpr int GU_RP = WARPS * GU_RPW;          // 16 row pairs per block
+// down: 4 lanes per output row, 5 of the row's 20 items (32 values) each; 8 rows per warp
+constexpr int D_ITEMS = FF / 32;               // 20
+constexpr int D_LPR = 4;
+constexpr int D_IPL = D_ITEMS / D_LPR;         // 5 items per lane
+constexpr int D_ROWS = WARPS * (32 / D_LPR);   // 64 rows per block
+static_assert(H % SLICE == 0 && FF % GU_RP == 0 && D_ITEMS % D_LPR == 0 && H % D_ROWS == 0, "tiling");
 
 constexpr int B_IQ3XXS = 98, B_IQ3S = 110, B_IQ2S = 82, B_IQ4NL = 18, B_Q20 = 18;   // bytes per block
 static_assert(sizeof(block_iq3_xxs) == B_IQ3XXS && sizeof(block_iq3_s) == B_IQ3S && sizeof(block_iq2_s) == B_IQ2S &&
@@ -48,11 +68,6 @@ __device__ __forceinline__ uint32_t as_u(half2 h) { uint32_t u; memcpy(&u, &h, 4
 __device__ __forceinline__ uint32_t ld16(const uint8_t* p) { return __ldg((const unsigned short*) p); }
 __device__ __forceinline__ uint32_t ld32(const uint8_t* p) { return ld16(p) | (ld16(p + 2) << 16); }
 __device__ __forceinline__ float ldh(const uint8_t* p) { return __half2float(__ushort_as_half((unsigned short) ld16(p))); }
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
 // four UNSIGNED bytes -> (b0,b1), (b2,b3) as exact halves: 0x64XX is 1024 + XX
 __device__ __forceinline__ void u8x4_h2(uint32_t g, half2& lo, half2& hi) {
     const half2 k = as_h2(0x64006400u);
@@ -67,9 +82,10 @@ __device__ __forceinline__ void s8x4_h2(uint32_t g, half2& lo, half2& hi) {
     hi = __hsub2(as_h2(__byte_perm(g, 0x64646464u, 0x4342)), k);
 }
 __device__ __forceinline__ half2 sgn(half2 w, uint32_t m) { return as_h2(as_u(w) ^ m); }
-__device__ __forceinline__ float h2sum(half2 a) { return __low2float(a) + __high2float(a); }
+// exact: both halves convert exactly and their fp32 sum is exact (|sum| < 2^12, 11-bit mantissas)
+__device__ __forceinline__ float h2sum(half2 a) { return __fadd_rn(__low2float(a), __high2float(a)); }
 
-// ------------------------------------------------------------------------------------------------ shared tables
+// ------------------------------------------------------------------------------------------------ shared memory
 // s_sgn[s]: the four half2 sign masks for 8 values whose sign bits are s (bit j negates value j)
 __shared__ uint4 s_sgn[256];
 __shared__ uint2 s_g3xxs[256];              // IQ3 grids pre-converted: four halves per entry
@@ -77,10 +93,13 @@ __shared__ uint2 s_g3s[512];
 __shared__ uint2 s_g2s[1024];
 __shared__ uint2 s_q2[256];                 // Q2_0: code byte -> four values (code - 1) as two half2
 __shared__ uint32_t s_nl[256];              // IQ4_NL: code byte -> (kvalues[lo nibble], kvalues[hi nibble]) half2
-__shared__ __align__(16) half2 s_x[H / 2];  // the current entry's activation, fp16
-__shared__ float s_xd[H / 32];              // its per-32 scale
-__shared__ __align__(16) half2 s_h[FF / 2];
-__shared__ float s_hd[FF / 32];
+// gate/up: one K-slice of every entry of the chunk as q/128 in fp16, [entry][quarter l][sub-block] (8 KB), and the
+// per-32 scale d * 128
+__shared__ __align__(16) uint4 s_xs[NE_MAX * 4 * SLICE_SB];
+__shared__ float s_xsd[NE_MAX * SLICE_SB];
+// down: every entry's SwiGLU output / its per-32 power-of-two scale, [entry][quarter k][item] (10 KB), and the scale
+__shared__ __align__(16) uint4 s_hs[NE_MAX * 4 * D_ITEMS];
+__shared__ float s_hsd[NE_MAX * D_ITEMS];
 
 __device__ __forceinline__ void fill_sgn(int t) {
     for (int s = t; s < 256; s += THREADS) {
@@ -109,169 +128,341 @@ __device__ __forceinline__ void fill_gu_tables(int t) {
     }
 }
 
-// ------------------------------------------------------------------------------------------------ gate/up decoders
-// One 32-value sub-block sb (of the row's H/32) against the staged activation: sum of w * x without the activation's
-// scale.  x values are q/128, |x| < 1; the codebook magnitudes are <= 62, so a half lane's 16 products stay < 1000.
-template<int TG> __device__ __forceinline__ float gu_sub(const uint8_t* row, int sb);
-
-template<> __device__ __forceinline__ float gu_sub<18>(const uint8_t* row, int sb) {   // IQ3_XXS (vec_dot_iq3_xxs)
-    const uint8_t* b = row + (unsigned) (sb >> 3) * B_IQ3XXS;
-    const int ib = sb & 7;
-    const float d = ldh(b);
-    const uint32_t q0 = ld32(b + 2 + 8 * ib), q1 = ld32(b + 2 + 8 * ib + 4);
-    const uint32_t aux = ld32(b + 2 + 64 + 4 * ib);
-    const uint4* xv = reinterpret_cast<const uint4*>(s_x + sb * 16);
-    half2 acc = __float2half2_rn(0.f);
+template<int TD>
+__device__ __forceinline__ void fill_down_tables(int t) {
+    if constexpr (TD == 20) {
+        for (int v = t; v < 256; v += THREADS)
+            s_nl[v] = as_u(__halves2half2(__int2half_rn(kvalues_iq4nl[v & 15]), __int2half_rn(kvalues_iq4nl[v >> 4])));
+    } else {
+        for (int v = t; v < 256; v += THREADS) {
+            half vals[4];
 #pragma unroll
-    for (int l = 0; l < 4; ++l) {
+            for (int j = 0; j < 4; ++j) vals[j] = __int2half_rn((int) ((v >> (2 * j)) & 3) - 1);
+            s_q2[v] = make_uint2(as_u(__halves2half2(vals[0], vals[1])), as_u(__halves2half2(vals[2], vals[3])));
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ gate/up decoders
+// GuW<TG>: one 32-value sub-block sb of a row.  load() reads its raw words (global, 2-byte aligned); quarter(l)
+// decodes values 8l..8l+7 to four sign-applied half2; scale(k) is the fp32 scale of the k-th of NS equal parts.
+template<int TG> struct GuW;
+
+template<> struct GuW<18> {   // IQ3_XXS (vec_dot_iq3_xxs)
+    static constexpr int NS = 1;
+    float d;
+    uint32_t q0, q1, aux;
+    __device__ __forceinline__ void load(const uint8_t* row, int sb) {
+        const uint8_t* b = row + (unsigned) (sb >> 3) * B_IQ3XXS;
+        const int ib = sb & 7;
+        d = ldh(b);
+        q0 = ld32(b + 2 + 8 * ib);
+        q1 = ld32(b + 2 + 8 * ib + 4);
+        aux = ld32(b + 2 + 64 + 4 * ib);
+    }
+    __device__ __forceinline__ void quarter(int l, half2 (&w)[4]) const {
         const uint32_t qq = l < 2 ? q0 : q1, sh = 16 * (l & 1);
         const uint32_t s7 = (aux >> (7 * l)) & 127u;
         const uint4 m = s_sgn[s7 | ((__popc(s7) & 1u) << 7)];
         const uint2 ga = s_g3xxs[(qq >> sh) & 0xFF], gb = s_g3xxs[(qq >> (sh + 8)) & 0xFF];
-        const half2 w0 = as_h2(ga.x), w1 = as_h2(ga.y), w2 = as_h2(gb.x), w3 = as_h2(gb.y);
-        const uint4 x = xv[l];
-        acc = __hfma2(sgn(w0, m.x), as_h2(x.x), acc);
-        acc = __hfma2(sgn(w1, m.y), as_h2(x.y), acc);
-        acc = __hfma2(sgn(w2, m.z), as_h2(x.z), acc);
-        acc = __hfma2(sgn(w3, m.w), as_h2(x.w), acc);
+        w[0] = sgn(as_h2(ga.x), m.x); w[1] = sgn(as_h2(ga.y), m.y);
+        w[2] = sgn(as_h2(gb.x), m.z); w[3] = sgn(as_h2(gb.y), m.w);
     }
-    return d * (0.5f + (float) (aux >> 28)) * 0.5f * h2sum(acc);
-}
+    __device__ __forceinline__ float scale(int) const { return d * (0.5f + (float) (aux >> 28)) * 0.5f; }
+};
 
-template<> __device__ __forceinline__ float gu_sub<21>(const uint8_t* row, int sb) {   // IQ3_S (vec_dot_iq3_s)
-    const uint8_t* b = row + (unsigned) (sb >> 3) * B_IQ3S;
-    const int ib = sb & 7;
-    const float d = ldh(b);
-    const uint32_t q0 = ld32(b + 2 + 8 * ib), q1 = ld32(b + 2 + 8 * ib + 4);
-    const uint32_t qh = __ldg(b + 2 + 64 + ib);
-    const uint32_t sg = ld32(b + 2 + 64 + 8 + 4 * ib);
-    const uint32_t sc = (__ldg(b + 2 + 64 + 8 + 32 + (ib >> 1)) >> (4 * (ib & 1))) & 0xF;
-    const uint4* xv = reinterpret_cast<const uint4*>(s_x + sb * 16);
-    half2 acc = __float2half2_rn(0.f);
-#pragma unroll
-    for (int l = 0; l < 4; ++l) {
+template<> struct GuW<21> {   // IQ3_S (vec_dot_iq3_s)
+    static constexpr int NS = 1;
+    float d;
+    uint32_t q0, q1, qh, sg, sc;
+    __device__ __forceinline__ void load(const uint8_t* row, int sb) {
+        const uint8_t* b = row + (unsigned) (sb >> 3) * B_IQ3S;
+        const int ib = sb & 7;
+        d = ldh(b);
+        q0 = ld32(b + 2 + 8 * ib);
+        q1 = ld32(b + 2 + 8 * ib + 4);
+        qh = __ldg(b + 2 + 64 + ib);
+        sg = ld32(b + 2 + 64 + 8 + 4 * ib);
+        sc = (__ldg(b + 2 + 64 + 8 + 32 + (ib >> 1)) >> (4 * (ib & 1))) & 0xF;
+    }
+    __device__ __forceinline__ void quarter(int l, half2 (&w)[4]) const {
         const uint32_t qq = l < 2 ? q0 : q1, sh = 16 * (l & 1);
         const uint32_t i0 = ((qq >> sh) & 0xFF) | ((qh << (8 - 2 * l)) & 0x100);
         const uint32_t i1 = ((qq >> (sh + 8)) & 0xFF) | ((qh << (7 - 2 * l)) & 0x100);
         const uint4 m = s_sgn[(sg >> (8 * l)) & 0xFF];
         const uint2 ga = s_g3s[i0], gb = s_g3s[i1];
-        const half2 w0 = as_h2(ga.x), w1 = as_h2(ga.y), w2 = as_h2(gb.x), w3 = as_h2(gb.y);
-        const uint4 x = xv[l];
-        acc = __hfma2(sgn(w0, m.x), as_h2(x.x), acc);
-        acc = __hfma2(sgn(w1, m.y), as_h2(x.y), acc);
-        acc = __hfma2(sgn(w2, m.z), as_h2(x.z), acc);
-        acc = __hfma2(sgn(w3, m.w), as_h2(x.w), acc);
+        w[0] = sgn(as_h2(ga.x), m.x); w[1] = sgn(as_h2(ga.y), m.y);
+        w[2] = sgn(as_h2(gb.x), m.z); w[3] = sgn(as_h2(gb.y), m.w);
     }
-    return d * (float) (1 + 2 * sc) * h2sum(acc);
-}
+    __device__ __forceinline__ float scale(int) const { return d * (float) (1 + 2 * sc); }
+};
 
-template<> __device__ __forceinline__ float gu_sub<22>(const uint8_t* row, int sb) {   // IQ2_S (vec_dot_iq2_s)
-    const uint8_t* b = row + (unsigned) (sb >> 3) * B_IQ2S;
-    const int ib = sb & 7;
-    const float d = ldh(b);
-    const uint32_t gi = ld32(b + 2 + 4 * ib);
-    const uint32_t sg = ld32(b + 2 + 32 + 4 * ib);
-    const uint32_t qh = __ldg(b + 2 + 64 + ib);
-    const uint32_t sc = __ldg(b + 2 + 64 + 8 + ib);
-    const uint4* xv = reinterpret_cast<const uint4*>(s_x + sb * 16);
-    half2 a0 = __float2half2_rn(0.f), a1 = a0;
-#pragma unroll
-    for (int l = 0; l < 4; ++l) {
+template<> struct GuW<22> {   // IQ2_S (vec_dot_iq2_s): two 16-value halves with their own 4-bit scales
+    static constexpr int NS = 2;
+    float d;
+    uint32_t gi, sg, qh, sc;
+    __device__ __forceinline__ void load(const uint8_t* row, int sb) {
+        const uint8_t* b = row + (unsigned) (sb >> 3) * B_IQ2S;
+        const int ib = sb & 7;
+        d = ldh(b);
+        gi = ld32(b + 2 + 4 * ib);
+        sg = ld32(b + 2 + 32 + 4 * ib);
+        qh = __ldg(b + 2 + 64 + ib);
+        sc = __ldg(b + 2 + 64 + 8 + ib);
+    }
+    __device__ __forceinline__ void quarter(int l, half2 (&w)[4]) const {
         const uint32_t idx = ((gi >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300);
         const uint2 gr = s_g2s[idx];
         const uint4 m = s_sgn[(sg >> (8 * l)) & 0xFF];
         half2 w0, w1, w2, w3;
         u8x4_h2(gr.x, w0, w1);
         u8x4_h2(gr.y, w2, w3);
-        const uint4 x = xv[l];
-        half2& a = l < 2 ? a0 : a1;
-        a = __hfma2(sgn(w0, m.x), as_h2(x.x), a);
-        a = __hfma2(sgn(w1, m.y), as_h2(x.y), a);
-        a = __hfma2(sgn(w2, m.z), as_h2(x.z), a);
-        a = __hfma2(sgn(w3, m.w), as_h2(x.w), a);
+        w[0] = sgn(w0, m.x); w[1] = sgn(w1, m.y); w[2] = sgn(w2, m.z); w[3] = sgn(w3, m.w);
     }
-    return d * 0.25f * ((0.5f + (float) (sc & 0xF)) * h2sum(a0) + (0.5f + (float) (sc >> 4)) * h2sum(a1));
+    __device__ __forceinline__ float scale(int k) const { return d * 0.25f * (0.5f + (float) ((sc >> (4 * k)) & 0xF)); }
+};
+
+// One decoded sub-block against NE staged entries: acc[j] += x_scale[j] * w_scale * sum(w * x_j).  xs / xd point at
+// the lane's sub-block in s_xs / s_xsd.  Each entry's operations are the same whatever NE is (explicit roundings,
+// no contraction freedom), so an entry's result does not depend on the grouping.
+//
+// Bounds: x = q/128 with |q| <= 127, so |x| < 1; the codebook magnitudes are <= 62 (IQ3_XXS), 15 (IQ3_S), 43 (IQ2_S).
+// A half lane accumulates 16 products (IQ2_S: 8 per part), so |partial| <= 16 * 62 = 992, far below fp16's 65504;
+// the fp16 rounding error of the chain is <= 16 * 2^-11 * 992 < 8 absolute, ~2^-11 relative per step.
+template<int TG, int NE>
+__device__ __forceinline__ void gu_dot(const GuW<TG>& w, const uint4* __restrict__ xs, const float* __restrict__ xd,
+                                       float (&acc)[NE]) {
+    constexpr int NS = GuW<TG>::NS;
+    half2 a[NE][NS];
+#pragma unroll
+    for (int j = 0; j < NE; ++j)
+#pragma unroll
+        for (int k = 0; k < NS; ++k) a[j][k] = __float2half2_rn(0.f);
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        half2 q[4];
+        w.quarter(l, q);
+        const int k = NS == 1 ? 0 : l >> 1;
+#pragma unroll
+        for (int j = 0; j < NE; ++j) {
+            const uint4 x = xs[(j * 4 + l) * SLICE_SB];
+            a[j][k] = __hfma2(q[0], as_h2(x.x), a[j][k]);
+            a[j][k] = __hfma2(q[1], as_h2(x.y), a[j][k]);
+            a[j][k] = __hfma2(q[2], as_h2(x.z), a[j][k]);
+            a[j][k] = __hfma2(q[3], as_h2(x.w), a[j][k]);
+        }
+    }
+    float ws[NS];
+#pragma unroll
+    for (int k = 0; k < NS; ++k) ws[k] = w.scale(k);
+#pragma unroll
+    for (int j = 0; j < NE; ++j) {
+        float v = __fmul_rn(ws[0], h2sum(a[j][0]));
+        if constexpr (NS == 2) v = __fmaf_rn(ws[1], h2sum(a[j][1]), v);
+        acc[j] = __fmaf_rn(xd[j * SLICE_SB], v, acc[j]);
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ down decoders
-// 32 values (one IQ4_NL block, half a Q2_0 block) against the staged SwiGLU output (|h/scale| <= 1): IQ4_NL
-// magnitudes are <= 127, so a half lane's 16 products stay < 2048.
-template<int TD> __device__ __forceinline__ float down_item(const uint8_t* row, int it);
+// DnW<TD>: 32 values of a down row (one IQ4_NL block, half a Q2_0 block).  quarter(k) = values of uint4 k of the
+// staged activation.
+template<int TD> struct DnW;
 
-template<> __device__ __forceinline__ float down_item<20>(const uint8_t* row, int it) {   // IQ4_NL
+template<> struct DnW<20> {   // IQ4_NL
     // byte j of the block holds values j (low nibble) and j + 16 (high nibble); the staged activation of an IQ4_NL
     // block is interleaved to match - half2 j = (x[j], x[j + 16]) - so each byte is one table load and one HFMA2
-    const uint8_t* b = row + (unsigned) it * B_IQ4NL;
-    const float d = ldh(b);
-    const uint4* xv = reinterpret_cast<const uint4*>(s_h + it * 16);
-    half2 acc = __float2half2_rn(0.f);
+    float d;
+    uint32_t w[4];
+    __device__ __forceinline__ void load(const uint8_t* row, int it) {
+        const uint8_t* b = row + (unsigned) it * B_IQ4NL;
+        d = ldh(b);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) w[k] = ld32(b + 2 + 4 * k);
+    }
+    __device__ __forceinline__ void quarter(int k, half2 (&q)[4]) const {
+        q[0] = as_h2(s_nl[w[k] & 0xFF]);
+        q[1] = as_h2(s_nl[(w[k] >> 8) & 0xFF]);
+        q[2] = as_h2(s_nl[(w[k] >> 16) & 0xFF]);
+        q[3] = as_h2(s_nl[w[k] >> 24]);
+    }
+};
+
+template<> struct DnW<42> {   // Q2_0: value = code - 1, 16 codes per word, LSB first
+    float d;
+    uint32_t w[2];
+    __device__ __forceinline__ void load(const uint8_t* row, int it) {
+        const uint8_t* b = row + (unsigned) (it >> 1) * B_Q20;
+        d = ldh(b);
+        const uint8_t* qs = b + 2 + 8 * (it & 1);
+        w[0] = ld32(qs);
+        w[1] = ld32(qs + 4);
+    }
+    __device__ __forceinline__ void quarter(int k, half2 (&q)[4]) const {
+        const uint32_t v = w[k >> 1] >> (16 * (k & 1));
+        const uint2 w0 = s_q2[v & 0xFF], w1 = s_q2[(v >> 8) & 0xFF];
+        q[0] = as_h2(w0.x); q[1] = as_h2(w0.y); q[2] = as_h2(w1.x); q[3] = as_h2(w1.y);
+    }
+};
+
+// Bounds: the staged h is h / s with s the power of two >= the 32-block's max |h|, so |x| <= 1; IQ4_NL magnitudes
+// are <= 127 (Q2_0: 2), so a half lane's 16 products stay <= 2032 < 65504.
+template<int TD, int NE>
+__device__ __forceinline__ void down_dot(const DnW<TD>& w, const uint4* __restrict__ xs, const float* __restrict__ xd,
+                                         float (&acc)[NE]) {
+    half2 a[NE];
+#pragma unroll
+    for (int j = 0; j < NE; ++j) a[j] = __float2half2_rn(0.f);
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        const uint32_t w = ld32(b + 2 + 4 * k);
-        const uint4 x = xv[k];
-        acc = __hfma2(as_h2(s_nl[w & 0xFF]), as_h2(x.x), acc);
-        acc = __hfma2(as_h2(s_nl[(w >> 8) & 0xFF]), as_h2(x.y), acc);
-        acc = __hfma2(as_h2(s_nl[(w >> 16) & 0xFF]), as_h2(x.z), acc);
-        acc = __hfma2(as_h2(s_nl[w >> 24]), as_h2(x.w), acc);
-    }
-    return d * h2sum(acc);
-}
-
-template<> __device__ __forceinline__ float down_item<42>(const uint8_t* row, int it) {   // Q2_0: value = code - 1
-    const uint8_t* b = row + (unsigned) (it >> 1) * B_Q20;
-    const float d = ldh(b);
-    const uint8_t* qs = b + 2 + 8 * (it & 1);
-    const uint4* xv = reinterpret_cast<const uint4*>(s_h + it * 16);
-    half2 acc = __float2half2_rn(0.f);
+        half2 q[4];
+        w.quarter(k, q);
 #pragma unroll
-    for (int k = 0; k < 2; ++k) {
-        const uint32_t w = ld32(qs + 4 * k);                                 // 16 codes, LSB first
-#pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const uint2 w0 = s_q2[(w >> (16 * j)) & 0xFF], w1 = s_q2[(w >> (16 * j + 8)) & 0xFF];
-            const uint4 x = xv[2 * k + j];
-            acc = __hfma2(as_h2(w0.x), as_h2(x.x), acc);
-            acc = __hfma2(as_h2(w0.y), as_h2(x.y), acc);
-            acc = __hfma2(as_h2(w1.x), as_h2(x.z), acc);
-            acc = __hfma2(as_h2(w1.y), as_h2(x.w), acc);
+        for (int j = 0; j < NE; ++j) {
+            const uint4 x = xs[(j * 4 + k) * D_ITEMS];
+            a[j] = __hfma2(q[0], as_h2(x.x), a[j]);
+            a[j] = __hfma2(q[1], as_h2(x.y), a[j]);
+            a[j] = __hfma2(q[2], as_h2(x.z), a[j]);
+            a[j] = __hfma2(q[3], as_h2(x.w), a[j]);
         }
     }
-    return d * h2sum(acc);
+#pragma unroll
+    for (int j = 0; j < NE; ++j) acc[j] = __fmaf_rn(xd[j * D_ITEMS], __fmul_rn(w.d, h2sum(a[j])), acc[j]);
+}
+
+// ------------------------------------------------------------------------------------------------ chunks
+// NE entries (tokens tok[0..NE)) of one group through gate/up rows r0.. r0+GU_RPW-1.  Block-uniform: every thread
+// calls it with the same NE, and its barriers are unconditional.
+template<int TG, int NE>
+__device__ __forceinline__ void gu_chunk(const uint8_t* __restrict__ mat, size_t gu_row, int r0,
+                                         const block_q8_1* __restrict__ xq, const int32_t* __restrict__ tok,
+                                         float* __restrict__ dst, int t, int lane) {
+    const int sl = lane & 15;
+    const uint8_t* rows[GU_RPW];
+#pragma unroll
+    for (int i = 0; i < GU_RPW; ++i) rows[i] = mat + (size_t) (r0 + i) * gu_row;
+    GuW<TG> w[GU_RPW];   // the next slice's raw words: loaded before the barriers, used after them
+#pragma unroll
+    for (int i = 0; i < GU_RPW; ++i) w[i].load(rows[i], sl);
+    float acc[GU_RPW][NE];
+#pragma unroll
+    for (int i = 0; i < GU_RPW; ++i)
+#pragma unroll
+        for (int j = 0; j < NE; ++j) acc[i][j] = 0.0f;
+    const half2 inv128 = __float2half2_rn(1.0f / 128.0f);
+#pragma unroll 1
+    for (int s = 0; s < N_SLICE; ++s) {
+        __syncthreads();   // tables filled / the previous slice consumed
+#pragma unroll 1
+        for (int i = t; i < NE * (SLICE / 4); i += THREADS) {   // one word (4 int8 values) each
+            const int j = i / (SLICE / 4), v = i % (SLICE / 4), b = v >> 3, q = v & 7;
+            const block_q8_1* blk = xq + (size_t) __ldg(tok + j) * (H / 32) + s * SLICE_SB + b;
+            half2 lo, hi;
+            s8x4_h2(__ldg(reinterpret_cast<const unsigned int*>(blk->qs) + q), lo, hi);   // q exactly
+            reinterpret_cast<uint2*>(s_xs)[((j * 4 + (q >> 1)) * SLICE_SB + b) * 2 + (q & 1)] =
+                make_uint2(as_u(__hmul2(lo, inv128)), as_u(__hmul2(hi, inv128)));        // q/128 exactly
+            if (q == 0) s_xsd[j * SLICE_SB + b] = ldh(reinterpret_cast<const uint8_t*>(blk)) * 128.0f;
+        }
+        __syncthreads();
+        GuW<TG> cur[GU_RPW];
+#pragma unroll
+        for (int i = 0; i < GU_RPW; ++i) cur[i] = w[i];
+        if (s + 1 < N_SLICE) {
+#pragma unroll
+            for (int i = 0; i < GU_RPW; ++i) w[i].load(rows[i], (s + 1) * SLICE_SB + sl);
+        }
+#pragma unroll
+        for (int i = 0; i < GU_RPW; ++i) gu_dot<TG, NE>(cur[i], s_xs + sl, s_xsd + sl, acc[i]);
+    }
+    // each half-warp sums its 16 lanes (fixed butterfly order); lane j of the half writes entry j
+#pragma unroll
+    for (int i = 0; i < GU_RPW; ++i)
+#pragma unroll
+        for (int j = 0; j < NE; ++j) {
+            float v = acc[i][j];
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o));
+            if (sl == j) dst[(size_t) j * FF + r0 + i] = v;
+        }
+}
+
+template<int TD, int NE>
+__device__ __forceinline__ void down_chunk(const uint8_t* __restrict__ mat, size_t d_row, int r,
+                                           const float* __restrict__ hc, const int32_t* __restrict__ dst,
+                                           float* __restrict__ out, int t, int lane) {
+    const int q = lane & (D_LPR - 1);
+    const uint8_t* wr = mat + (size_t) r * d_row;
+    DnW<TD> w;          // item q: loaded before the barriers
+    w.load(wr, q);
+    __syncthreads();    // tables filled / the previous chunk consumed
+#pragma unroll 1
+    for (int i = t; i < NE * FF; i += THREADS) {   // whole warps: a warp covers one aligned 32-block of one entry
+        const float v = hc[i];
+        float amax = fabsf(v);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        // the next power of two >= amax: dividing by it is exact, and |h / s| <= 1 keeps fp16 sums in range
+        const float s = amax > 1e-30f ? __int_as_float((__float_as_int(amax) + 0x007FFFFF) & 0x7F800000) : 1.0f;
+        const int j = i / FF, u = i - j * FF, it = u >> 5, jj = u & 31;
+        // IQ4_NL: value jj of a 32-block goes to half 2jj for jj < 16, 2(jj-16) + 1 otherwise (see DnW<20>)
+        const int slot = TD == 20 ? (jj < 16 ? 2 * jj : 2 * (jj - 16) + 1) : jj;
+        reinterpret_cast<half*>(s_hs)[((j * 4 + (slot >> 3)) * D_ITEMS + it) * 8 + (slot & 7)] =
+            __float2half_rn(v * (1.0f / s));
+        if (jj == 0) s_hsd[j * D_ITEMS + it] = s;
+    }
+    __syncthreads();
+    float acc[NE];
+#pragma unroll
+    for (int j = 0; j < NE; ++j) acc[j] = 0.0f;
+#pragma unroll 1
+    for (int m = 0; m < D_IPL; ++m) {   // the next item's words are loaded while this one is multiplied
+        const int it = q + D_LPR * m;
+        const DnW<TD> cur = w;
+        if (m + 1 < D_IPL) w.load(wr, it + D_LPR);
+        down_dot<TD, NE>(cur, s_hs + it, s_hsd + it, acc);
+    }
+#pragma unroll
+    for (int j = 0; j < NE; ++j) {
+        float v = acc[j];
+        v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, 1));
+        v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, 2));
+        if (q == (j & (D_LPR - 1))) out[(size_t) __ldg(dst + j) * H + r] = v;
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ kernels
+// Groups g = blockIdx.y, blockIdx.y + gridDim.y, ... < *n_groups; every block-level branch depends only on the
+// group / chunk, so the barriers are block-uniform.
 template<int TG>
-__global__ void __launch_bounds__(THREADS) pgu_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                      const int32_t* __restrict__ grp_start,
-                                                      const int32_t* __restrict__ n_groups,
-                                                      const int32_t* __restrict__ ent_tok,
-                                                      const block_q8_1* __restrict__ xq, size_t up_off, size_t gu_row,
-                                                      float* __restrict__ gate, float* __restrict__ up) {
-    const int g = blockIdx.y;
-    if (g >= *n_groups) return;
+__global__ void __launch_bounds__(THREADS, 4) pgu_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                         const int32_t* __restrict__ grp_start,
+                                                         const int32_t* __restrict__ n_groups,
+                                                         const int32_t* __restrict__ ent_tok,
+                                                         const block_q8_1* __restrict__ xq, size_t up_off,
+                                                         size_t gu_row, float* __restrict__ gate,
+                                                         float* __restrict__ up) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    fill_gu_tables<TG>(t);
-    const int row0 = blockIdx.x * GU_ROWS;               // 32 rows: all gate or all up (FF % 32 == 0)
-    const bool is_up = row0 >= FF;
-    const uint8_t* mat = (const uint8_t*) grp_ptr[g] + (is_up ? up_off : 0);
-    float* dst = is_up ? up : gate;
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
-    for (int e = e0; e < e1; ++e) {
-        __syncthreads();                                   // tables filled / the previous entry consumed
-        const block_q8_1* xe = xq + (size_t) ent_tok[e] * (H / 32);
-        for (int i = t; i < H; i += THREADS) {             // q/128: exact in fp16
-            const int8_t q = xe[i >> 5].qs[i & 31];
-            reinterpret_cast<half*>(s_x)[i] = __float2half_rn((float) q * (1.0f / 128.0f));
-            if ((i & 31) == 0) s_xd[i >> 5] = __low2float(xe[i >> 5].ds) * 128.0f;
-        }
-        __syncthreads();
-        for (int rr = warp; rr < GU_ROWS; rr += WARPS) {
-            const int r = (row0 + rr) - (is_up ? FF : 0);
-            const uint8_t* wr = mat + (size_t) r * gu_row;
-            float s = 0.0f;
-            for (int sb = lane; sb < H / 32; sb += 32) s += s_xd[sb] * gu_sub<TG>(wr, sb);
-            s = warp_sum(s);
-            if (lane == 0) dst[(size_t) e * FF + r] = s;
+    fill_gu_tables<TG>(t);   // the chunk's first barrier publishes them
+    const int r0 = blockIdx.x * GU_RP + warp * GU_RPW;
+    const bool is_up = lane >= 16;
+    float* dstm = is_up ? up : gate;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* mat = (const uint8_t*) grp_ptr[g] + (is_up ? up_off : 0);
+        const int e1 = grp_start[g + 1];
+        for (int c = grp_start[g]; c < e1; c += NE_MAX) {
+            const int32_t* tk = ent_tok + c;
+            float* d = dstm + (size_t) c * FF;
+            switch (min(NE_MAX, e1 - c)) {
+                case 1: gu_chunk<TG, 1>(mat, gu_row, r0, xq, tk, d, t, lane); break;
+                case 2: gu_chunk<TG, 2>(mat, gu_row, r0, xq, tk, d, t, lane); break;
+                case 3: gu_chunk<TG, 3>(mat, gu_row, r0, xq, tk, d, t, lane); break;
+                case 4: gu_chunk<TG, 4>(mat, gu_row, r0, xq, tk, d, t, lane); break;
+                case 5: gu_chunk<TG, 5>(mat, gu_row, r0, xq, tk, d, t, lane); break;
+                case 6: gu_chunk<TG, 6>(mat, gu_row, r0, xq, tk, d, t, lane); break;
+                case 7: gu_chunk<TG, 7>(mat, gu_row, r0, xq, tk, d, t, lane); break;
+                default: gu_chunk<TG, 8>(mat, gu_row, r0, xq, tk, d, t, lane); break;
+            }
         }
     }
 }
@@ -285,53 +476,33 @@ __global__ void swiglu_kernel(const float* __restrict__ gate, const float* __res
 }
 
 template<int TD>
-__global__ void __launch_bounds__(THREADS) pdown_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                        const int32_t* __restrict__ grp_start,
-                                                        const int32_t* __restrict__ n_groups,
-                                                        const int32_t* __restrict__ ent_dst,
-                                                        const float* __restrict__ h, size_t down_off, size_t d_row,
-                                                        float* __restrict__ out) {
-    const int g = blockIdx.y;
-    if (g >= *n_groups) return;
+__global__ void __launch_bounds__(THREADS, 4) pdown_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                           const int32_t* __restrict__ grp_start,
+                                                           const int32_t* __restrict__ n_groups,
+                                                           const int32_t* __restrict__ ent_dst,
+                                                           const float* __restrict__ h, size_t down_off,
+                                                           size_t d_row, float* __restrict__ out) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    if constexpr (TD == 20) {
-        for (int v = t; v < 256; v += THREADS)
-            s_nl[v] = as_u(__halves2half2(__int2half_rn(kvalues_iq4nl[v & 15]), __int2half_rn(kvalues_iq4nl[v >> 4])));
-    }
-    if constexpr (TD == 42) {
-        for (int v = t; v < 256; v += THREADS) {
-            half vals[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) vals[j] = __int2half_rn((int) ((v >> (2 * j)) & 3) - 1);
-            s_q2[v] = make_uint2(as_u(__halves2half2(vals[0], vals[1])), as_u(__halves2half2(vals[2], vals[3])));
-        }
-    }
-    const int row0 = blockIdx.x * D_ROWS;
-    const uint8_t* mat = (const uint8_t*) grp_ptr[g] + down_off;
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
-    for (int e = e0; e < e1; ++e) {
-        __syncthreads();
-        const float* he = h + (size_t) e * FF;
-        for (int i = t; i < FF; i += THREADS) {           // a warp covers 32 aligned values: one scale block
-            const float v = he[i];
-            float amax = fabsf(v);
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-            // the next power of two >= amax: dividing by it is exact, and |h / s| <= 1 keeps fp16 sums in range
-            const float s = amax > 1e-30f ? __int_as_float((__float_as_int(amax) + 0x007FFFFF) & 0x7F800000) : 1.0f;
-            // IQ4_NL: value j of a 32-block goes to half (2j) for j < 16, (2(j-16) + 1) otherwise (see down_item<20>)
-            const int j = i & 31, slot = TD == 20 ? (i & ~31) + (j < 16 ? 2 * j : 2 * (j - 16) + 1) : i;
-            reinterpret_cast<half*>(s_h)[slot] = __float2half_rn(v * (1.0f / s));
-            if ((i & 31) == 0) s_hd[i >> 5] = s;
-        }
-        __syncthreads();
-        for (int rr = warp; rr < D_ROWS; rr += WARPS) {
-            const int r = row0 + rr;
-            const uint8_t* wr = mat + (size_t) r * d_row;
-            // 20 items of 32 values (lanes 0..19), as the int8 kernel
-            const float s = lane < FF / 32 ? s_hd[lane] * down_item<TD>(wr, lane) : 0.0f;
-            const float sum = warp_sum(s);
-            if (lane == 0) out[(size_t) ent_dst[e] * H + r] = sum;
+    fill_down_tables<TD>(t);   // the chunk's first barrier publishes them
+    const int r = blockIdx.x * D_ROWS + warp * (32 / D_LPR) + lane / D_LPR;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* mat = (const uint8_t*) grp_ptr[g] + down_off;
+        const int e1 = grp_start[g + 1];
+        for (int c = grp_start[g]; c < e1; c += NE_MAX) {
+            const float* hc = h + (size_t) c * FF;
+            const int32_t* ds = ent_dst + c;
+            switch (min(NE_MAX, e1 - c)) {
+                case 1: down_chunk<TD, 1>(mat, d_row, r, hc, ds, out, t, lane); break;
+                case 2: down_chunk<TD, 2>(mat, d_row, r, hc, ds, out, t, lane); break;
+                case 3: down_chunk<TD, 3>(mat, d_row, r, hc, ds, out, t, lane); break;
+                case 4: down_chunk<TD, 4>(mat, d_row, r, hc, ds, out, t, lane); break;
+                case 5: down_chunk<TD, 5>(mat, d_row, r, hc, ds, out, t, lane); break;
+                case 6: down_chunk<TD, 6>(mat, d_row, r, hc, ds, out, t, lane); break;
+                case 7: down_chunk<TD, 7>(mat, d_row, r, hc, ds, out, t, lane); break;
+                default: down_chunk<TD, 8>(mat, d_row, r, hc, ds, out, t, lane); break;
+            }
         }
     }
 }
@@ -387,7 +558,7 @@ bool pascal_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     float* up = (float*) ((uint8_t*) scratch + fa);
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
-    const dim3 ggu((unsigned) (2 * FF / GU_ROWS), (unsigned) cap_groups);
+    const dim3 ggu((unsigned) (FF / GU_RP), (unsigned) cap_groups);
     switch (L.gu_type) {
         case 18: launch_gu<18>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 21: launch_gu<21>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
