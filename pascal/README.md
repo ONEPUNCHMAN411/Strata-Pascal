@@ -45,3 +45,38 @@ matches BF16 on ISTA's AIME25 / GPQA-D / LCB v6 benchmarks):
 
 IQ3_S tensor types (ISTA allocation file): expert gate/up IQ2_S x20, IQ3_XXS x17, IQ3_S x10, IQ4_XS x1 layers; expert
 down IQ4_NL x39, Q2_0 x9; dense mostly Q6_K / Q4_K / Q5_K / IQ4_XS / IQ4_NL. All run in the kernels tuned above.
+
+## Using the MoE and both P100s well (this server: E5-2678 v3, 128 GB DDR4-1600, 2x P100 PCIe 3.0 x16)
+
+How Strata runs a token here: each of the 48 layers routes to 10 of 512 experts. Experts in VRAM run on the GPU;
+missed ones are either copied over PCIe and run on the GPU (a share set by a PCIe probe, ~0.25 at ~12 GB/s) or
+computed by the CPU (AVX2 on this Xeon, bounded by ~35-40 GB/s of DDR4-1600). With `--gpus 0,1` the layers are
+split between the cards (each holds its own copy of the dense weights and a cache of its layers' hottest experts,
+~21 GB of experts in total vs ~11 GB on one card); a verify window runs card 0's layers, then card 1's.
+
+Fixed in this fork (Linux):
+- **The whole expert arena is pinned with two GPUs.** Upstream capped pinning at 8 GiB whenever more than one GPU was
+  used - a Windows (WDDM) workaround applied on Linux too. With IQ3_S that left ~7 of 48 layers pinned: every other
+  layer had **no PCIe share** (all misses on the CPU) and its adaptive cache swaps copied from pageable memory.
+  `STRATA_PIN_LIMIT_GIB=N` restores a cap if pinning ~50 GB ever causes trouble.
+- **Transparent huge pages for the arena** when no hugetlb pool is reserved (Ubuntu's THP mode is `madvise`), so the
+  CPU expert kernels stop missing the TLB across 50 GB.
+
+After installing, check the startup log:
+- `expert arena: cudaHostRegister PORTABLE ok; ... MADV_HUGEPAGE` - the whole arena is pinned and THP-backed
+- `PCIe probe: ~12 GB/s -> pcie_frac ...` on each card
+- `layer split auto: K=..`, `expert cache auto: .. slots` per card, `decode expert cache hit rate` per request
+
+Then tune for this CPU/PCIe balance (the defaults were measured on a Ryzen 7600 + RTX 5070 on PCIe 5):
+
+    ./setup.sh --calibrate          # measures --pcie-frac, --spec-min-p, --pool-workers and saves the winners
+
+Optional:
+- n-gram table in RAM instead of NVMe reads: add `"--ple-io", "ram"` to `"args"` in `strata-*.json` (28.8 GB locked;
+  arena 50 GB + table 29 GB + your other services must fit in 125 GB).
+- An expert profile from your own traffic (better VRAM hit rate for your workload): run with
+  `"--dump-routing", "routing.bin"` for a while, then `python tools/make_profile.py` (see its header) and point
+  `--expert-profile` at the result.
+
+Where the time goes (send me this): add `"env": {"STRATA_DECODE_TIMING": "1", "STRATA_SPLIT_TIMING": "1"}` to the
+config, send one ~500-token request, and copy the per-window timing lines (GPU wait vs CPU pool vs staging per card).

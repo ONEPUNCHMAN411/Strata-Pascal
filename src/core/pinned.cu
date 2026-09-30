@@ -209,7 +209,12 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
     note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     got = PageBacking::NormalPages;
-    return p == MAP_FAILED ? nullptr : p;
+    if (p == MAP_FAILED) return nullptr;
+    // No reserved pool: ask for transparent huge pages instead (Ubuntu's default THP mode is "madvise", so without
+    // this the ~50 GB arena is 4 KB pages and the CPU expert kernels' scattered reads miss the TLB constantly).
+    // Advisory: the note says whether the kernel took it; pinning and mlock work the same on THP-backed memory.
+    if (madvise(p, bytes, MADV_HUGEPAGE) == 0) note = "MAP_HUGETLB unavailable; 4 KB pages with MADV_HUGEPAGE (THP)";
+    return p;
 #endif
 }
 

@@ -2278,7 +2278,15 @@ int main(int argc, char** argv) {
         // Unregistered layers remain in the resident arena and use the CPU expert path.
         // (a layer split across GPUs too: pinning all of it into two contexts leaves WDDM refusing every later
         // allocation - measured on the 5080 + 3090 rig: cudaMemGetInfo and the next cudaMalloc fail)
-        const uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (8ull << 30) : 0;
+        // That is a WDDM limit: on Linux a layer split pins the whole arena (portable, so every card maps it), or
+        // every layer past the first ~8 GiB has no PCIe share and its adaptive swaps copy from pageable memory.
+        // STRATA_PIN_LIMIT_GIB overrides either way (0 = no cap).
+#ifdef _WIN32
+        uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (8ull << 30) : 0;
+#else
+        uint64_t pin_limit = 0;
+#endif
+        if (const char* pl = std::getenv("STRATA_PIN_LIMIT_GIB")) pin_limit = std::strtoull(pl, nullptr, 10) << 30;
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
