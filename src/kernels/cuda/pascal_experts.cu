@@ -523,14 +523,41 @@ bool enabled_here() {
     return cc[dev] == 6;
 }
 
+// Grid rows (groups in flight) for a kernel whose grid has gx columns: as many as keep every SM filled with the
+// blocks it can hold at once (one wave; a block loops over groups g = blockIdx.y + k * gridDim.y), so an empty or
+// small call launches that one wave instead of gx * cap_groups mostly-empty blocks.  Per device, cached.
+template<class Kernel>
+int wave_rows(Kernel kernel, int slot, int gx) {
+    static int cache[64][5] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 1; }
+    int& c = cache[dev][slot];
+    if (c == 0) {
+        int sms = 0, per_sm = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, THREADS, 0) != cudaSuccess) {
+            cudaGetLastError();
+            per_sm = 1;
+        }
+        c = sms * per_sm / gx > 1 ? sms * per_sm / gx : 1;
+    }
+    return c;
+}
+
 template<int TG>
-void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* gp, const int32_t* gs, const int32_t* ng,
+void launch_gu(int64_t cap_groups, cudaStream_t s, const unsigned long long* gp, const int32_t* gs, const int32_t* ng,
                const int32_t* tok, const block_q8_1* x, const NativeExpertLayout& L, float* h) {
+    constexpr int gx = FF / GU_RP;
+    const int gy = wave_rows(pgu_kernel<TG>, TG == 18 ? 0 : TG == 21 ? 1 : 2, gx);
+    const dim3 grid((unsigned) gx, (unsigned) (cap_groups < gy ? cap_groups : gy));
     pgu_kernel<TG><<<grid, THREADS, 0, s>>>(gp, gs, ng, tok, x, L.up_off, L.gu_row, h);
 }
 template<int TD>
-void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* gp, const int32_t* gs, const int32_t* ng,
-                 const int32_t* dst, const float* h, const NativeExpertLayout& L, float* out) {
+void launch_down(int64_t cap_groups, cudaStream_t s, const unsigned long long* gp, const int32_t* gs,
+                 const int32_t* ng, const int32_t* dst, const float* h, const NativeExpertLayout& L, float* out) {
+    constexpr int gx = H / D_ROWS;
+    const int gy = wave_rows(pdown_kernel<TD>, TD == 20 ? 3 : 4, gx);
+    const dim3 grid((unsigned) gx, (unsigned) (cap_groups < gy ? cap_groups : gy));
     pdown_kernel<TD><<<grid, THREADS, 0, s>>>(gp, gs, ng, dst, h, L.down_off, L.d_row, out);
 }
 
@@ -551,15 +578,14 @@ bool pascal_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const size_t f = (size_t) cap_entries * FF * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
-    const dim3 ggu((unsigned) (FF / GU_RP), (unsigned) cap_groups);
+    // both kernels: one wave of blocks (the grid rows loop over the device-side group count), whatever the caps
     switch (L.gu_type) {
-        case 18: launch_gu<18>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, h); break;
-        case 21: launch_gu<21>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, h); break;
-        default: launch_gu<22>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, h); break;
+        case 18: launch_gu<18>(cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, h); break;
+        case 21: launch_gu<21>(cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, h); break;
+        default: launch_gu<22>(cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, h); break;
     }
-    const dim3 gd((unsigned) (H / D_ROWS), (unsigned) cap_groups);
-    if (L.d_type == 20) launch_down<20>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
-    else launch_down<42>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
+    if (L.d_type == 20) launch_down<20>(cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
+    else launch_down<42>(cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "pascal_expert_grouped: %s\n", cudaGetErrorString(e));
