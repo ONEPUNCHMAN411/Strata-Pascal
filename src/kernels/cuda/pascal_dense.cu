@@ -16,8 +16,8 @@
 // sums at most 16 products (8 for Q6_K), each bounded by the format's largest magnitude BEFORE any scale:
 //     Q8_0 |q| <= 128           -> 16 * 128 = 2048
 //     IQ4_NL / IQ4_XS |kv| <= 127 -> 16 * 127 = 2032
-//     Q4_K q <= 15               -> 16 * 15  =  240   (the min is applied in fp32 from the staged q8_1 sums)
-//     Q5_K q <= 31               -> 16 * 31  =  496   (likewise)
+//     Q4_K |q - 8| <= 8          -> 16 * 8   =  128   (the min is applied in fp32 from the staged q8_1 sums)
+//     Q5_K |q - 16| <= 16        -> 16 * 16  =  256   (likewise)
 //     Q6_K |q - 32| <= 32         ->  8 * 32  =  256   (per 16-value sub-block: its int8 scale is applied in fp32)
 // and the flush adds the two half lanes in fp16 (<= 4096).  Every fp16 partial sum stays far below 65504, whatever
 // the block scales (d, dmin, the K-quant sub-block scales and the q8_1 d are all applied in fp32).
@@ -159,40 +159,48 @@ __device__ __forceinline__ void stage(const block_q8_1* __restrict__ x, int xs, 
 }
 
 // ------------------------------------------------------------------------------------------------ unit helpers
-// 8 values of each of the two rows (wv[r][0..3]) against staged chunk `off` (in halves) of every column
-template<int NC>
-__device__ __forceinline__ void fma8(half2 (&h)[2][NC], const half2 (&wv)[2][4], const half* s_x, int off) {
-    constexpr int KT = kt_of(NC);
+// A unit's weights, decoded: wv[r][4p + i] is half2 i of chunk p (8 values) of row r.  Per column: chunk p is
+// multiplied with the staged activation chunk at off[p] (in halves) into one half2 accumulator per row, folded into
+// fp32 with the weight scale times the activation's per-32 scale at the end of each scale group.  Q6 (two 16-value
+// sub-blocks): chunks 0-1 fold with wsA and activation group xgA, chunks 2-3 with wsB / xgB; otherwise all four fold
+// once with wsB / xgB.  Column-outer order: only two fp16 accumulators are live at a time.
+template<int NC, bool Q6>
+__device__ __forceinline__ void cols(float (&acc)[2][NC], const half2 (&wv)[2][16], const int (&off)[4],
+                                     const float (&wsA)[2], int xgA, const float (&wsB)[2], int xgB,
+                                     const half* s_x, const float* s_xd) {
+    constexpr int KT = kt_of(NC), G = KT / 32;
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
-        const uint4 xv = *reinterpret_cast<const uint4*>(s_x + c * KT + off);
+        const half* sx = s_x + c * KT;
+        half2 h[2] = {__float2half2_rn(0.0f), __float2half2_rn(0.0f)};
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            h[r][c] = __hfma2(wv[r][0], as_h2(xv.x), h[r][c]);
-            h[r][c] = __hfma2(wv[r][1], as_h2(xv.y), h[r][c]);
-            h[r][c] = __hfma2(wv[r][2], as_h2(xv.z), h[r][c]);
-            h[r][c] = __hfma2(wv[r][3], as_h2(xv.w), h[r][c]);
+        for (int p = 0; p < 4; ++p) {
+            const uint4 xv = *reinterpret_cast<const uint4*>(sx + off[p]);
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                h[r] = __hfma2(wv[r][4 * p + 0], as_h2(xv.x), h[r]);
+                h[r] = __hfma2(wv[r][4 * p + 1], as_h2(xv.y), h[r]);
+                h[r] = __hfma2(wv[r][4 * p + 2], as_h2(xv.z), h[r]);
+                h[r] = __hfma2(wv[r][4 * p + 3], as_h2(xv.w), h[r]);
+            }
+            if (Q6 && p == 1) {
+                const float xd = s_xd[c * G + xgA];
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    acc[r][c] = fmaf(wsA[r] * xd, hsum(h[r]), acc[r][c]);
+                    h[r] = __float2half2_rn(0.0f);
+                }
+            }
         }
+        const float xd = s_xd[c * G + xgB];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) acc[r][c] = fmaf(wsB[r] * xd, hsum(h[r]), acc[r][c]);
     }
 }
-// fold the fp16 accumulators into fp32: weight scale ws[r] times the activation scale of group `xg`
-template<int NC>
-__device__ __forceinline__ void flush(float (&acc)[2][NC], half2 (&h)[2][NC], const float (&ws)[2],
-                                      const float* s_xd, int xg) {
-    constexpr int G = kt_of(NC) / 32;
+// one 32-group per unit: chunks 4 gl .. 4 gl + 3
+template<int TY> __device__ __forceinline__ void group_offs(int gl, int (&off)[4]) {
 #pragma unroll
-    for (int c = 0; c < NC; ++c) {
-        const float xd = s_xd[c * G + xg];
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            acc[r][c] = fmaf(ws[r] * xd, hsum(h[r][c]), acc[r][c]);
-            h[r][c] = __float2half2_rn(0.0f);
-        }
-    }
-}
-template<int NC> __device__ __forceinline__ void zero(half2 (&h)[2][NC]) {
-#pragma unroll
-    for (int c = 0; c < NC; ++c) h[0][c] = h[1][c] = __float2half2_rn(0.0f);
+    for (int p = 0; p < 4; ++p) off[p] = 8 * swz<TY>(4 * gl + p);
 }
 
 // ------------------------------------------------------------------------------------------------ units
@@ -208,44 +216,37 @@ template<int NC> struct Unit<14, NC> {
     __device__ static __forceinline__ void run(const uint8_t* const (&wr)[2], int gg, int gl, const half* s_x,
                                                const float* s_xd, const float*, const uint32_t*, float (&acc)[2][NC]) {
         const int sub = gg & 7, n = sub >> 2, j = (sub >> 1) & 1, hq = sub & 1;
-        uint32_t A[2][4], H[2][4];
+        const uint32_t shA = 4 - 2 * hq, shB = 2 * hq;
+        half2 wv[2][16];
         float wsA[2], wsB[2];
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             const uint8_t* b = wr[r] + (unsigned) (gg >> 3) * 210u;
-            ld16B(b + 64 * n + 32 * hq + 16 * j, A[r]);
-            ld16B(b + 128 + 32 * n + 16 * j, H[r]);
+            uint32_t A[4], H[4];
+            ld16B(b + 64 * n + 32 * hq + 16 * j, A);
+            ld16B(b + 128 + 32 * n + 16 * j, H);
             const float d = ldh(b + 208);
             wsA[r] = d * (float) (int8_t) __ldg(b + 192 + 8 * n + 2 * hq + j);
             wsB[r] = d * (float) (int8_t) __ldg(b + 196 + 8 * n + 2 * hq + j);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {   // word k: l = 16j + 4k .. +3; chunk k/2 of quadrant h, 2 + k/2 of h + 2
+                const uint32_t lo = (A[k] & 0x0F0F0F0Fu) | ((H[k] << shA) & 0x30303030u);
+                const uint32_t hi = ((A[k] >> 4) & 0x0F0F0F0Fu) | ((H[k] >> shB) & 0x30303030u);
+                u8x4_h2(lo, 0x64206420u, wv[r][2 * k], wv[r][2 * k + 1]);          // q - 32
+                u8x4_h2(hi, 0x64206420u, wv[r][8 + 2 * k], wv[r][8 + 2 * k + 1]);
+            }
         }
         const int lsb = gl >> 3, cb = 32 * lsb + 16 * n + 4 * hq + 2 * j, xg = 8 * lsb + 4 * n + hq;
-        const uint32_t shA = 4 - 2 * hq, shB = 2 * hq;
-        half2 h[2][NC];
-        zero(h);
-#pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            half2 wv[2][4];
-#pragma unroll
-            for (int r = 0; r < 2; ++r) {
-#pragma unroll
-                for (int q = 0; q < 2; ++q) {
-                    const int k = 2 * (p & 1) + q;
-                    const uint32_t v = p < 2 ? ((A[r][k] & 0x0F0F0F0Fu) | ((H[r][k] << shA) & 0x30303030u))
-                                             : (((A[r][k] >> 4) & 0x0F0F0F0Fu) | ((H[r][k] >> shB) & 0x30303030u));
-                    u8x4_h2(v, 0x64206420u, wv[r][2 * q], wv[r][2 * q + 1]);   // q - 32
-                }
-            }
-            fma8(h, wv, s_x, 8 * swz<14>(cb + (p & 1) + 8 * (p >> 1)));
-            if (p == 1) flush(acc, h, wsA, s_xd, xg);
-            if (p == 3) flush(acc, h, wsB, s_xd, xg + 2);
-        }
+        const int off[4] = {8 * swz<14>(cb), 8 * swz<14>(cb + 1), 8 * swz<14>(cb + 8), 8 * swz<14>(cb + 9)};
+        cols<NC, true>(acc, wv, off, wsA, xg, wsB, xg + 2, s_x, s_xd);
     }
 };
 
 // Q4_K / Q5_K (dequantize_row_q4_K / q5_K): group g of a superblock (j64 = g / 2, hi = g & 1), value l in 0..31 is
 //   q = (qs[32 j64 + l] >> 4hi) & 0xF  (+ 16 * ((qh[l] >> g) & 1) for Q5_K);  w = d * sc_g * q - dmin * m_g
-// with (sc_g, m_g) = get_scale_min_k4(g, scales).  sum w x = d sc_g xd sum(q * x/xd) - dmin m_g sum(x).
+// with (sc_g, m_g) = get_scale_min_k4(g, scales).  The code is centred, c = q - 8 (Q5_K: q - 16), which halves the
+// fp16 partial sums at no cost (the bias is in the byte->half constant):
+//   sum w x = d sc_g xd sum(c * x/xd) - (dmin m_g - 8 d sc_g) sum(x)        (16 for Q5_K)
 template<int TY, int NC> struct UnitK {
     __device__ static __forceinline__ void run(const uint8_t* const (&wr)[2], int gg, int gl, const half* s_x,
                                                const float* s_xd, const float* s_xs, const uint32_t*,
@@ -254,7 +255,7 @@ template<int TY, int NC> struct UnitK {
         constexpr unsigned BB = Q5 ? 176u : 144u;
         constexpr int QS = Q5 ? 48 : 16;
         const int g = gg & 7, j64 = g >> 1, hi = g & 1;
-        uint32_t Q[2][8], QH[2][8];
+        half2 wv[2][16];
         float ws[2], mn[2];
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
@@ -266,31 +267,17 @@ template<int TY, int NC> struct UnitK {
             const uint32_t sc = g < 4 ? (b0 & 63) : ((b2 & 0xF) | ((b0 >> 6) << 4));
             const uint32_t m = g < 4 ? (b1 & 63) : ((b2 >> 4) | ((b1 >> 6) << 4));
             ws[r] = __low2float(dm) * (float) sc;
-            mn[r] = __high2float(dm) * (float) m;
+            mn[r] = __high2float(dm) * (float) m - (Q5 ? 16.0f : 8.0f) * ws[r];
 #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                Q[r][k] = ld32a(b + QS + 32 * j64 + 4 * k);
-                if constexpr (Q5) QH[r][k] = ld32a(b + 16 + 4 * k);
+            for (int k = 0; k < 8; ++k) {   // word k: l = 4k .. 4k + 3
+                uint32_t v = (ld32a(b + QS + 32 * j64 + 4 * k) >> (4 * hi)) & 0x0F0F0F0Fu;
+                if constexpr (Q5) v |= ((ld32a(b + 16 + 4 * k) >> g) & 0x01010101u) << 4;
+                u8x4_h2(v, Q5 ? 0x64106410u : 0x64086408u, wv[r][2 * k], wv[r][2 * k + 1]);   // q - 16 / q - 8
             }
         }
-        half2 h[2][NC];
-        zero(h);
-#pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            half2 wv[2][4];
-#pragma unroll
-            for (int r = 0; r < 2; ++r) {
-#pragma unroll
-                for (int q = 0; q < 2; ++q) {
-                    const int k = 2 * p + q;
-                    uint32_t v = (Q[r][k] >> (4 * hi)) & 0x0F0F0F0Fu;
-                    if constexpr (Q5) v |= ((QH[r][k] >> g) & 0x01010101u) << 4;
-                    u8x4_h2(v, 0x64006400u, wv[r][2 * q], wv[r][2 * q + 1]);
-                }
-            }
-            fma8(h, wv, s_x, 8 * swz<TY>(4 * gl + p));
-        }
-        flush(acc, h, ws, s_xd, gl);
+        int off[4];
+        group_offs<TY>(gl, off);
+        cols<NC, false>(acc, wv, off, ws, gl, ws, gl, s_x, s_xd);
         constexpr int G = kt_of(NC) / 32;
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
@@ -307,50 +294,41 @@ template<int NC> struct Unit<13, NC> : UnitK<13, NC> {};
 template<int NC> struct Unit<8, NC> {
     __device__ static __forceinline__ void run(const uint8_t* const (&wr)[2], int gg, int gl, const half* s_x,
                                                const float* s_xd, const float*, const uint32_t*, float (&acc)[2][NC]) {
-        uint32_t Q[2][8];
+        half2 wv[2][16];
         float ws[2];
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             const uint8_t* b = wr[r] + (unsigned) gg * 34u;
             ws[r] = ldh(b);
-            uint32_t lo[4], hi[4];
-            ld16B(b + 2, lo);
-            ld16B(b + 18, hi);
+            uint32_t q[8];
+            ld16B(b + 2, *reinterpret_cast<uint32_t(*)[4]>(q));
+            ld16B(b + 18, *reinterpret_cast<uint32_t(*)[4]>(q + 4));
 #pragma unroll
-            for (int k = 0; k < 4; ++k) { Q[r][k] = lo[k]; Q[r][4 + k] = hi[k]; }
+            for (int k = 0; k < 8; ++k) s8x4_h2(q[k], wv[r][2 * k], wv[r][2 * k + 1]);
         }
-        half2 h[2][NC];
-        zero(h);
-#pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            half2 wv[2][4];
-#pragma unroll
-            for (int r = 0; r < 2; ++r) {
-                s8x4_h2(Q[r][2 * p], wv[r][0], wv[r][1]);
-                s8x4_h2(Q[r][2 * p + 1], wv[r][2], wv[r][3]);
-            }
-            fma8(h, wv, s_x, 8 * swz<8>(4 * gl + p));
-        }
-        flush(acc, h, ws, s_xd, gl);
+        int off[4];
+        group_offs<8>(gl, off);
+        cols<NC, false>(acc, wv, off, ws, gl, ws, gl, s_x, s_xd);
     }
 };
 
 // IQ4_NL / IQ4_XS (dequantize_row_iq4_nl / iq4_xs): byte j of a 32-group's 16 code bytes holds value j (low nibble)
 // and j + 16 (high nibble); s_nl[byte] is (kvalues[lo], kvalues[hi]) and the activation is staged interleaved to
-// match, so each byte is one table load and one HFMA2 per column.  IQ4_XS group ib: scale d * (ls - 32) with
+// match, so each byte is one table load.  IQ4_XS group ib: scale d * (ls - 32) with
 // ls = ((scales_l[ib / 2] >> 4(ib % 2)) & 0xF) | (((scales_h >> 2ib) & 3) << 4).
 template<int TY, int NC> struct UnitIQ4 {
     __device__ static __forceinline__ void run(const uint8_t* const (&wr)[2], int gg, int gl, const half* s_x,
                                                const float* s_xd, const float*, const uint32_t* s_nl,
                                                float (&acc)[2][NC]) {
-        uint32_t Q[2][4];
+        half2 wv[2][16];
         float ws[2];
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
+            uint32_t q[4];
             if constexpr (TY == 20) {
                 const uint8_t* b = wr[r] + (unsigned) gg * 18u;
                 ws[r] = ldh(b);
-                ld16B(b + 2, Q[r]);
+                ld16B(b + 2, q);
             } else {
                 const uint8_t* b = wr[r] + (unsigned) (gg >> 3) * 136u;
                 const int ib = gg & 7;
@@ -358,22 +336,16 @@ template<int TY, int NC> struct UnitIQ4 {
                 const int ls = (int) (((sl >> (4 * ib)) & 0xF) | (((hd >> (16 + 2 * ib)) & 3) << 4));
                 ws[r] = __low2float(as_h2(hd)) * (float) (ls - 32);
 #pragma unroll
-                for (int k = 0; k < 4; ++k) Q[r][k] = ld32a(b + 8 + 16 * ib + 4 * k);
+                for (int k = 0; k < 4; ++k) q[k] = ld32a(b + 8 + 16 * ib + 4 * k);
             }
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) wv[r][4 * k + i] = as_h2(s_nl[(q[k] >> (8 * i)) & 0xFF]);
         }
-        half2 h[2][NC];
-        zero(h);
-#pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            half2 wv[2][4];
-#pragma unroll
-            for (int r = 0; r < 2; ++r) {
-#pragma unroll
-                for (int i = 0; i < 4; ++i) wv[r][i] = as_h2(s_nl[(Q[r][p] >> (8 * i)) & 0xFF]);
-            }
-            fma8(h, wv, s_x, 8 * swz<TY>(4 * gl + p));
-        }
-        flush(acc, h, ws, s_xd, gl);
+        int off[4];
+        group_offs<TY>(gl, off);
+        cols<NC, false>(acc, wv, off, ws, gl, ws, gl, s_x, s_xd);
     }
 };
 template<int NC> struct Unit<20, NC> : UnitIQ4<20, NC> {};
