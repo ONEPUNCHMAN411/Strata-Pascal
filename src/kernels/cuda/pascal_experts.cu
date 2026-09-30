@@ -330,12 +330,13 @@ __device__ __forceinline__ void down_dot(const DnW<TD>& w, const uint4* __restri
 }
 
 // ------------------------------------------------------------------------------------------------ chunks
-// NE entries (tokens tok[0..NE)) of one group through gate/up rows r0.. r0+GU_RPW-1.  Block-uniform: every thread
-// calls it with the same NE, and its barriers are unconditional.
+// NE entries (tokens tok[0..NE)) of one group through gate and up rows r0 .. r0+GU_RPW-1, fused with SwiGLU:
+// hc[j * FF + r] = silu(gate_r . x_j) * (up_r . x_j).  Block-uniform: every thread calls it with the same NE, and its
+// barriers are unconditional.
 template<int TG, int NE>
 __device__ __forceinline__ void gu_chunk(const uint8_t* __restrict__ mat, size_t gu_row, int r0,
                                          const block_q8_1* __restrict__ xq, const int32_t* __restrict__ tok,
-                                         float* __restrict__ dst, int t, int lane) {
+                                         float* __restrict__ hc, int t, int lane) {
     const int sl = lane & 15;
     const uint8_t* rows[GU_RPW];
 #pragma unroll
@@ -373,16 +374,21 @@ __device__ __forceinline__ void gu_chunk(const uint8_t* __restrict__ mat, size_t
 #pragma unroll
         for (int i = 0; i < GU_RPW; ++i) gu_dot<TG, NE>(cur[i], s_xs + sl, s_xsd + sl, acc[i]);
     }
-    // each half-warp sums its 16 lanes (fixed butterfly order); lane j of the half writes entry j
+    // each half-warp sums its 16 lanes (fixed butterfly order); lane j < NE of the gate half takes entry j's gate
+    // and up sums and writes its SwiGLU output
 #pragma unroll
-    for (int i = 0; i < GU_RPW; ++i)
+    for (int i = 0; i < GU_RPW; ++i) {
+        float g = 0.0f, u = 0.0f;
 #pragma unroll
         for (int j = 0; j < NE; ++j) {
             float v = acc[i][j];
 #pragma unroll
             for (int o = 8; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o));
-            if (sl == j) dst[(size_t) j * FF + r0 + i] = v;
+            const float vu = __shfl_xor_sync(0xffffffffu, v, 16);
+            if (lane == j) { g = v; u = vu; }
         }
+        if (lane < NE) hc[(size_t) lane * FF + r0 + i] = (g / (1.0f + __expf(-g))) * u;
+    }
 }
 
 template<int TD, int NE>
@@ -438,21 +444,18 @@ __global__ void __launch_bounds__(THREADS, 4) pgu_kernel(const unsigned long lon
                                                          const int32_t* __restrict__ n_groups,
                                                          const int32_t* __restrict__ ent_tok,
                                                          const block_q8_1* __restrict__ xq, size_t up_off,
-                                                         size_t gu_row, float* __restrict__ gate,
-                                                         float* __restrict__ up) {
+                                                         size_t gu_row, float* __restrict__ h) {
     const int ng = *n_groups;
     if ((int) blockIdx.y >= ng) return;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     fill_gu_tables<TG>(t);   // the chunk's first barrier publishes them
     const int r0 = blockIdx.x * GU_RP + warp * GU_RPW;
-    const bool is_up = lane >= 16;
-    float* dstm = is_up ? up : gate;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
-        const uint8_t* mat = (const uint8_t*) grp_ptr[g] + (is_up ? up_off : 0);
+        const uint8_t* mat = (const uint8_t*) grp_ptr[g] + (lane >= 16 ? up_off : 0);   // gate | up half-warp
         const int e1 = grp_start[g + 1];
         for (int c = grp_start[g]; c < e1; c += NE_MAX) {
             const int32_t* tk = ent_tok + c;
-            float* d = dstm + (size_t) c * FF;
+            float* d = h + (size_t) c * FF;
             switch (min(NE_MAX, e1 - c)) {
                 case 1: gu_chunk<TG, 1>(mat, gu_row, r0, xq, tk, d, t, lane); break;
                 case 2: gu_chunk<TG, 2>(mat, gu_row, r0, xq, tk, d, t, lane); break;
@@ -465,14 +468,6 @@ __global__ void __launch_bounds__(THREADS, 4) pgu_kernel(const unsigned long lon
             }
         }
     }
-}
-
-__global__ void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                              long long n) {
-    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
 }
 
 template<int TD>
@@ -530,8 +525,8 @@ bool enabled_here() {
 
 template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* gp, const int32_t* gs, const int32_t* ng,
-               const int32_t* tok, const block_q8_1* x, const NativeExpertLayout& L, float* gate, float* up) {
-    pgu_kernel<TG><<<grid, THREADS, 0, s>>>(gp, gs, ng, tok, x, L.up_off, L.gu_row, gate, up);
+               const int32_t* tok, const block_q8_1* x, const NativeExpertLayout& L, float* h) {
+    pgu_kernel<TG><<<grid, THREADS, 0, s>>>(gp, gs, ng, tok, x, L.up_off, L.gu_row, h);
 }
 template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* gp, const int32_t* gs, const int32_t* ng,
@@ -552,20 +547,16 @@ bool pascal_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (!enabled_here()) return false;
     if (cap_groups <= 0 || cap_entries <= 0) return true;
     cudaStream_t s = (cudaStream_t) stream;
-    // native_expert_grouped's scratch: gate | up | h | (hq, unused here)
+    // native_expert_grouped's scratch: gate | up | h | hq; only h is used here (gate/up are fused into SwiGLU)
     const size_t f = (size_t) cap_entries * FF * sizeof(float), fa = (f + 255) & ~(size_t) 255;
-    float* gate = (float*) scratch;
-    float* up = (float*) ((uint8_t*) scratch + fa);
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     const dim3 ggu((unsigned) (FF / GU_RP), (unsigned) cap_groups);
     switch (L.gu_type) {
-        case 18: launch_gu<18>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 21: launch_gu<21>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        default: launch_gu<22>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 18: launch_gu<18>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, h); break;
+        case 21: launch_gu<21>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, h); break;
+        default: launch_gu<22>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, h); break;
     }
-    const long long nh = (long long) cap_entries * FF;
-    swiglu_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
     const dim3 gd((unsigned) (H / D_ROWS), (unsigned) cap_groups);
     if (L.d_type == 20) launch_down<20>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
     else launch_down<42>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
